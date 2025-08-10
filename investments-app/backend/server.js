@@ -43,16 +43,213 @@ function generatePrompt() {
   if (!objective) {
     return 'There is currently no investment objective set.';
   }
+  
   const lines = [];
   lines.push(`Target: ${objective.targetAmount} ${objective.currency}`);
-  lines.push('Investments:');
+  
+  // Group investments by year and month for more compact representation
+  const groupedInvestments = {};
+  let totalInvested = 0;
+  
   investments.forEach((inv) => {
-    lines.push(` - date: ${inv.date}, amount: ${inv.amount} ${inv.currency}, fund: ${inv.fund}, platform: ${inv.platform}`);
+    const date = new Date(inv.date);
+    const year = date.getFullYear();
+    const month = date.getMonth() + 1; // getMonth() returns 0-11
+    const key = `${year}-${month.toString().padStart(2, '0')}`;
+    
+    if (!groupedInvestments[key]) {
+      groupedInvestments[key] = {
+        total: 0,
+        count: 0,
+        funds: new Set(),
+        platforms: new Set()
+      };
+    }
+    
+    groupedInvestments[key].total += inv.amount;
+    groupedInvestments[key].count += 1;
+    groupedInvestments[key].funds.add(inv.fund);
+    groupedInvestments[key].platforms.add(inv.platform);
+    totalInvested += inv.amount;
   });
+  
+  // Sort by date (newest first)
+  const sortedKeys = Object.keys(groupedInvestments).sort().reverse();
+  
+  // Handle case with no investments
+  if (sortedKeys.length === 0) {
+    lines.push('No investments recorded yet.');
+    lines.push('Based on the target amount, estimate how much time it will take to reach the goal.');
+    lines.push('Please provide a short answer in this exact format: "It will take you X years" or "It will take you X months" where X is a number.');
+    lines.push('Be realistic and consider that no investments have been made yet.');
+    return lines.join('\n');
+  }
+  
+  lines.push(`Total invested: ${totalInvested.toFixed(2)} ${objective.currency}`);
+  lines.push(`Investment period: ${sortedKeys[sortedKeys.length - 1]} to ${sortedKeys[0]}`);
+  lines.push(`Number of investments: ${investments.length}`);
+  
+  // If we have too many months, group by quarters or years
+  if (sortedKeys.length > 12) {
+    // Group by quarters for better readability
+    const quarterlyData = {};
+    sortedKeys.forEach(key => {
+      const [year, month] = key.split('-');
+      const quarter = Math.ceil(parseInt(month) / 3);
+      const quarterKey = `${year}-Q${quarter}`;
+      
+      if (!quarterlyData[quarterKey]) {
+        quarterlyData[quarterKey] = {
+          total: 0,
+          count: 0,
+          funds: new Set(),
+          platforms: new Set()
+        };
+      }
+      
+      const data = groupedInvestments[key];
+      quarterlyData[quarterKey].total += data.total;
+      quarterlyData[quarterKey].count += data.count;
+      data.funds.forEach(fund => quarterlyData[quarterKey].funds.add(fund));
+      data.platforms.forEach(platform => quarterlyData[quarterKey].platforms.add(platform));
+    });
+    
+    lines.push('Quarterly investment summary:');
+    Object.keys(quarterlyData).sort().reverse().forEach(quarter => {
+      const data = quarterlyData[quarter];
+      lines.push(` - ${quarter}: ${data.total.toFixed(2)} ${objective.currency} (${data.count} investments, ${data.funds.size} funds)`);
+    });
+  } else {
+    // Show monthly breakdown if not too many months
+    lines.push('Monthly investment summary:');
+    sortedKeys.forEach(key => {
+      const data = groupedInvestments[key];
+      lines.push(` - ${key}: ${data.total.toFixed(2)} ${objective.currency} (${data.count} investments)`);
+    });
+  }
+  
+  // Add fund diversity information
+  const allFunds = new Set();
+  const allPlatforms = new Set();
+  investments.forEach(inv => {
+    allFunds.add(inv.fund);
+    allPlatforms.add(inv.platform);
+  });
+  
+  lines.push(`Portfolio diversity: ${allFunds.size} different funds across ${allPlatforms.size} platforms`);
+  
+  // Calculate average monthly investment, excluding significant one-time investments
+  const monthsDiff = sortedKeys.length;
+  
+  // Identify potential one-time investments (outliers)
+  const monthlyTotals = sortedKeys.map(key => groupedInvestments[key].total);
+  const sortedMonthlyTotals = [...monthlyTotals].sort((a, b) => a - b);
+  
+  // Calculate median and use it to identify outliers
+  const median = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length / 2)];
+  const q1 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.25)];
+  const q3 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.75)];
+  const iqr = q3 - q1;
+  
+  // Use a more conservative outlier threshold (0.5 * IQR instead of 1.0 * IQR)
+  // and also consider the median as a baseline for "normal" recurring investments
+  const outlierThreshold = Math.min(q3 + (0.5 * iqr), median * 1.8);
+  
+  // Additional check: if the median itself is high, use a percentage of it
+  const medianBasedThreshold = median * 1.2;
+  const finalThreshold = Math.min(outlierThreshold, medianBasedThreshold);
+  
+  // Filter out months with outlier investments for recurring calculation
+  const recurringMonths = sortedKeys.filter(key => {
+    const monthlyTotal = groupedInvestments[key].total;
+    return monthlyTotal <= finalThreshold;
+  });
+  
+  const recurringTotal = recurringMonths.reduce((sum, key) => sum + groupedInvestments[key].total, 0);
+  const avgMonthlyRecurring = recurringTotal / recurringMonths.length;
+  const avgMonthlyAll = totalInvested / monthsDiff;
+  
+  // Count outlier months
+  const outlierMonths = sortedKeys.filter(key => groupedInvestments[key].total > finalThreshold);
+  
+  if (outlierMonths.length > 0) {
+    lines.push(`Recurring monthly investment (excluding outliers): ${avgMonthlyRecurring.toFixed(2)} ${objective.currency}`);
+    lines.push(`Overall average (including all): ${avgMonthlyAll.toFixed(2)} ${objective.currency}`);
+    lines.push(`One-time investment months: ${outlierMonths.length} (${outlierMonths.map(m => groupedInvestments[m].total.toFixed(0)).join(', ')} ${objective.currency})`);
+  } else {
+    lines.push(`Average monthly investment: ${avgMonthlyAll.toFixed(2)} ${objective.currency}`);
+  }
+  
   lines.push('Based on the above investment history and the target, estimate how much time it will take to reach the goal.');
   lines.push('Please provide a short answer in this exact format: "It will take you X years" or "It will take you X months" where X is a number.');
+  if (outlierMonths.length > 0) {
+    lines.push('Focus on the recurring monthly investment rate, not the overall average which includes one-time large investments.');
+  }
   lines.push('Consider one-time investments vs recurring patterns. Be realistic and concise.');
-  return lines.join('\n');
+  
+  const prompt = lines.join('\n');
+  
+  // If prompt is still too long, create an even more compact version
+  if (prompt.length > 4000) {
+    const compactLines = [];
+    compactLines.push(`Target: ${objective.targetAmount} ${objective.currency}`);
+    compactLines.push(`Total invested: ${totalInvested.toFixed(2)} ${objective.currency}`);
+    compactLines.push(`Investment period: ${sortedKeys[sortedKeys.length - 1]} to ${sortedKeys[0]} (${sortedKeys.length} months)`);
+    compactLines.push(`Number of investments: ${investments.length}`);
+    compactLines.push(`Portfolio diversity: ${allFunds.size} funds across ${allPlatforms.size} platforms`);
+    
+    // Use the same outlier detection logic for compact version
+    const monthlyTotals = sortedKeys.map(key => groupedInvestments[key].total);
+    const sortedMonthlyTotals = [...monthlyTotals].sort((a, b) => a - b);
+    const median = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length / 2)];
+    const q1 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.25)];
+    const q3 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.75)];
+    const iqr = q3 - q1;
+    
+    // Use more conservative outlier detection
+    const outlierThreshold = Math.min(q3 + (0.5 * iqr), median * 1.8);
+    const medianBasedThreshold = median * 1.2;
+    const finalThreshold = Math.min(outlierThreshold, medianBasedThreshold);
+    
+    const recurringMonths = sortedKeys.filter(key => groupedInvestments[key].total <= finalThreshold);
+    const recurringTotal = recurringMonths.reduce((sum, key) => sum + groupedInvestments[key].total, 0);
+    const avgMonthlyRecurring = recurringTotal / recurringMonths.length;
+    const avgMonthlyAll = totalInvested / sortedKeys.length;
+    
+    const outlierMonths = sortedKeys.filter(key => groupedInvestments[key].total > finalThreshold);
+    
+    if (outlierMonths.length > 0) {
+      compactLines.push(`Recurring monthly: ${avgMonthlyRecurring.toFixed(2)} ${objective.currency} (excluding ${outlierMonths.length} outlier months)`);
+    } else {
+      compactLines.push(`Average monthly investment: ${avgMonthlyAll.toFixed(2)} ${objective.currency}`);
+    }
+    
+    // Show only the most recent 6 months if there are many months
+    if (sortedKeys.length > 6) {
+      compactLines.push('Recent 6 months:');
+      sortedKeys.slice(0, 6).forEach(key => {
+        const data = groupedInvestments[key];
+        compactLines.push(` - ${key}: ${data.total.toFixed(2)} ${objective.currency}`);
+      });
+    } else {
+      compactLines.push('Monthly breakdown:');
+      sortedKeys.forEach(key => {
+        const data = groupedInvestments[key];
+        compactLines.push(` - ${key}: ${data.total.toFixed(2)} ${objective.currency}`);
+      });
+    }
+    
+    compactLines.push('Based on the above investment history and the target, estimate how much time it will take to reach the goal.');
+    compactLines.push('Please provide a short answer in this exact format: "It will take you X years" or "It will take you X months" where X is a number.');
+    if (outlierMonths.length > 0) {
+      compactLines.push('Focus on the recurring monthly investment rate, not the overall average which includes one-time large investments.');
+    }
+    compactLines.push('Consider one-time investments vs recurring patterns. Be realistic and concise.');
+    
+    return compactLines.join('\n');
+  }
+  
+  return prompt;
 }
 
 /**

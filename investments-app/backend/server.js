@@ -151,6 +151,8 @@ function loadData() {
           }
         }
       });
+      // Sort investments by timestamp in descending order (newest first) when loading
+      investments.sort((a, b) => b.timestamp - a.timestamp);
       objective = parsed.objective || null;
     }
   } catch (err) {
@@ -382,7 +384,9 @@ function routeApi(pathName, method, body, res) {
   }
   if (pathName === '/api/investments') {
     if (method === 'GET') {
-      return sendJson(res, 200, investments);
+      // Sort investments by timestamp in descending order (newest first) before returning
+      const sortedInvestments = [...investments].sort((a, b) => b.timestamp - a.timestamp);
+      return sendJson(res, 200, sortedInvestments);
     } else if (method === 'POST') {
       // New investments can include the price per unit and the number of units
       // purchased.  If both `unitPrice` and `units` are provided and are
@@ -430,6 +434,8 @@ function routeApi(pathName, method, body, res) {
         newInv.isSale = true;
       }
       investments.push(newInv);
+      // Sort investments by timestamp in descending order (newest first) after adding
+      investments.sort((a, b) => b.timestamp - a.timestamp);
       saveData();
       return sendJson(res, 201, newInv);
     }
@@ -603,6 +609,8 @@ function routeApi(pathName, method, body, res) {
       newInvs.push(inv);
     }
     investments = newInvs;
+    // Sort investments by timestamp in descending order (newest first) after import
+    investments.sort((a, b) => b.timestamp - a.timestamp);
     saveData();
     return sendJson(res, 200, { imported: newInvs.length });
   }

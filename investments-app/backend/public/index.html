@@ -1,0 +1,1415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Investment Tracker</title>
+  <!-- Simple dark theme styling -->
+  <style>
+    /*
+      Use CSS variables to support light and dark themes.  The default
+      variable values implement the dark theme.  A .light-theme class on
+      the root element overrides these variables for light mode.
+    */
+    :root {
+      /*
+        Colour palette definitions.  These values were chosen to improve
+        contrast and provide a more modern look.  They are parameterised
+        so that switching themes simply overrides the variables.
+      */
+      --bg-color: #121212;
+      --card-bg-color: #1f2937; /* deep blue–grey */
+      --text-color: #e5e7eb;   /* light grey */
+      --primary-color: #3b82f6; /* sky blue */
+      --primary-hover: #2563eb; /* darker blue on hover */
+      --delete-color: #ef4444; /* soft red */
+      --delete-hover: #dc2626; /* darker red */
+      --border-color: #374151; /* slate */
+      --heading-color: #60a5fa; /* lighter blue for headings */
+      --row-alt-color: #1e293b; /* alternate row background */
+      --row-hover-color: #334155; /* hover row background */
+    }
+    .light-theme {
+      --bg-color: #f3f4f6;
+      --card-bg-color: #ffffff;
+      --text-color: #374151;
+      --primary-color: #2563eb;
+      --primary-hover: #1d4ed8;
+      --delete-color: #dc2626;
+      --delete-hover: #b91c1c;
+      --border-color: #e5e7eb;
+      --heading-color: #2563eb;
+      --row-alt-color: #f9fafb;
+      --row-hover-color: #e5e7eb;
+    }
+    body {
+      background-color: var(--bg-color);
+      color: var(--text-color);
+      font-family: Arial, Helvetica, sans-serif;
+      margin: 0;
+    }
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h1, h2, h3 {
+      color: var(--heading-color);
+      margin-top: 0;
+    }
+    .card {
+      background-color: var(--card-bg-color);
+      padding: 20px;
+      margin-bottom: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    }
+    label {
+      display: block;
+      margin-bottom: 4px;
+    }
+    input, select, button {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 12px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color);
+      background-color: var(--card-bg-color);
+      color: var(--text-color);
+    }
+    button {
+      cursor: pointer;
+      background-color: var(--primary-color);
+      border: none;
+      color: #ffffff;
+      transition: background-color 0.2s;
+    }
+    button:hover {
+      background-color: var(--primary-hover);
+    }
+
+    /* Special styling for the theme toggle button.  It is a compact
+       circular button displaying a sun or moon emoji depending on the
+       current theme. */
+    .theme-toggle {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.2rem;
+      padding: 0;
+      margin-bottom: 20px;
+      background-color: var(--card-bg-color);
+      color: var(--primary-color);
+      border: 1px solid var(--border-color);
+      transition: background-color 0.2s, color 0.2s;
+    }
+    .theme-toggle:hover {
+      background-color: var(--row-hover-color);
+    }
+    /* Distinct styling for delete buttons in the investment table */
+    .delete-btn {
+      background-color: var(--delete-color);
+      border: none;
+    }
+    .delete-btn:hover {
+      background-color: var(--delete-hover);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    th, td {
+      padding: 8px;
+      text-align: left;
+      border-bottom: 1px solid var(--border-color);
+    }
+    th {
+      color: var(--heading-color);
+    }
+
+    /* Alternate row colours and hover states for better readability */
+    tbody tr:nth-child(even) {
+      background-color: var(--row-alt-color);
+    }
+    tbody tr:hover {
+      background-color: var(--row-hover-color);
+    }
+
+    thead tr {
+      background-color: var(--card-bg-color);
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    .col {
+      flex: 1 1 300px;
+    }
+    .progress-bar {
+      background-color: var(--border-color);
+      border-radius: 4px;
+      overflow: hidden;
+      height: 20px;
+      margin-top: 8px;
+    }
+    .progress-bar-fill {
+      background-color: var(--primary-color);
+      height: 100%;
+      width: 0;
+      transition: width 0.3s;
+    }
+    .chart-container {
+      position: relative;
+      width: 100%;
+      height: 400px;
+    }
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .pagination button {
+      width: auto;
+      padding: 6px 12px;
+    }
+    
+    /* Loading animation styles */
+    .loading-spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid var(--border-color);
+      border-radius: 50%;
+      border-top-color: var(--primary-color);
+      animation: spin 1s ease-in-out infinite;
+      margin-right: 8px;
+    }
+    
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    
+    .prediction-button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 140px;
+    }
+    
+    .prediction-button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+  </style>
+  <!-- Load React and other dependencies from CDNs -->
+  <script crossorigin src="https://unpkg.com/react@17/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- SheetJS for Excel import/export -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- Application code written in JSX and compiled by Babel in the browser. -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // Component to add a new investment
+    function InvestmentForm({ currencies, onAdd, fundOptions = [], platformOptions = [] }) {
+      /*
+        The investment form allows the user to add a new investment.  In addition
+        to specifying the amount, currency and date, the user can either pick
+        from an existing fund/asset or platform or type a new one.  The
+        `fundOptions` and `platformOptions` props are arrays of strings
+        containing the unique values currently in the system.  They are used
+        to populate HTML datalists so the user can select a previously used
+        value or enter a new one.  The currency list comes from the rates
+        endpoint.  Default values for fundOptions and platformOptions ensure
+        the component works even when no options are provided.
+      */
+      const [form, setForm] = useState({
+        unitPrice: '',
+        units: '',
+        currency: currencies && currencies.length > 0 ? currencies[0] : 'RON',
+        fund: '',
+        platform: '',
+        date: new Date().toISOString().substr(0, 10)
+      });
+
+      useEffect(() => {
+        if (currencies && currencies.length > 0) {
+          setForm((prev) => ({ ...prev, currency: prev.currency || currencies[0] }));
+        }
+      }, [currencies]);
+
+      const handleChange = (e) => {
+        const { name, value } = e.target;
+        setForm({ ...form, [name]: value });
+      };
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        const price = parseFloat(form.unitPrice);
+        const units = parseFloat(form.units);
+        // Require both price and units to compute amount
+        if (!isNaN(price) && !isNaN(units) && units >= 0 && price >= 0) {
+          onAdd({ unitPrice: price, units: units, currency: form.currency, fund: form.fund || 'Unknown', platform: form.platform || 'Unknown', date: form.date });
+          // reset form
+          setForm({ ...form, unitPrice: '', units: '', fund: '', platform: '' });
+        }
+      };
+
+      return (
+        <div className="card">
+          <h2>Add Investment</h2>
+          <form onSubmit={handleSubmit}>
+            <label>Unit Price</label>
+            <input type="number" step="0.01" name="unitPrice" value={form.unitPrice} onChange={handleChange} required />
+            <label>Units</label>
+            <input type="number" step="0.0001" name="units" value={form.units} onChange={handleChange} required />
+            {/* Display calculated amount for user feedback */}
+            {form.unitPrice && form.units && !isNaN(parseFloat(form.unitPrice)) && !isNaN(parseFloat(form.units)) && (
+              <div style={{ marginBottom: '12px' }}>
+                <strong>Total Amount:</strong> {(parseFloat(form.unitPrice) * parseFloat(form.units)).toFixed(2)}
+              </div>
+            )}
+            <label>Currency</label>
+            <select name="currency" value={form.currency} onChange={handleChange}>
+              {currencies && currencies.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+            <label>Fund/Asset</label>
+            {/*
+              Use a datalist to provide autocomplete suggestions for existing
+              funds/assets.  The user can still type any value they like,
+              including one not in the list.  Each datalist must have a
+              unique id.  We use `fundList` and `platformList` here.
+            */}
+            <input type="text" name="fund" list="fundList" value={form.fund} onChange={handleChange} placeholder="e.g. Stock XYZ" />
+            <datalist id="fundList">
+              {fundOptions.map((opt) => (
+                <option key={opt} value={opt} />
+              ))}
+            </datalist>
+            <label>Platform</label>
+            <input type="text" name="platform" list="platformList" value={form.platform} onChange={handleChange} placeholder="e.g. Broker ABC" />
+            <datalist id="platformList">
+              {platformOptions.map((opt) => (
+                <option key={opt} value={opt} />
+              ))}
+            </datalist>
+            <label>Date</label>
+            <input type="date" name="date" value={form.date} onChange={handleChange} />
+            <button type="submit">Add</button>
+          </form>
+        </div>
+      );
+    }
+
+    // Component to sell units of an existing investment.  The user
+    // specifies the fund/asset, platform, number of units to sell and the
+    // sale price per unit.  Negative units are posted to the backend
+    // through the same endpoint as purchases.  Currency is selected
+    // separately to support multi‑currency portfolios.  A datalist
+    // provides existing fund and platform suggestions.
+    function SellForm({ currencies, onSell, fundOptions = [], platformOptions = [] }) {
+      const [form, setForm] = useState({
+        unitPrice: '',
+        units: '',
+        currency: currencies && currencies.length > 0 ? currencies[0] : 'RON',
+        fund: '',
+        platform: '',
+        date: new Date().toISOString().substr(0, 10),
+      });
+      useEffect(() => {
+        if (currencies && currencies.length > 0) {
+          setForm((prev) => ({ ...prev, currency: prev.currency || currencies[0] }));
+        }
+      }, [currencies]);
+      const handleChange = (e) => {
+        const { name, value } = e.target;
+        setForm({ ...form, [name]: value });
+      };
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        const price = parseFloat(form.unitPrice);
+        const units = parseFloat(form.units);
+        // Units must be positive for input; we will send negative value
+        if (!isNaN(price) && price >= 0 && !isNaN(units) && units > 0) {
+          onSell({ unitPrice: price, units: -Math.abs(units), currency: form.currency, fund: form.fund || 'Unknown', platform: form.platform || 'Unknown', date: form.date });
+          setForm({ ...form, unitPrice: '', units: '', fund: '', platform: '' });
+        }
+      };
+      return (
+        <div className="card">
+          <h2>Sell Units</h2>
+          <form onSubmit={handleSubmit}>
+            <label>Unit Price</label>
+            <input type="number" step="0.01" name="unitPrice" value={form.unitPrice} onChange={handleChange} required />
+            <label>Units to Sell</label>
+            <input type="number" step="0.0001" name="units" value={form.units} onChange={handleChange} required />
+            {form.unitPrice && form.units && !isNaN(parseFloat(form.unitPrice)) && !isNaN(parseFloat(form.units)) && (
+              <div style={{ marginBottom: '12px' }}>
+                <strong>Total Sale Amount:</strong> {(-parseFloat(form.unitPrice) * parseFloat(form.units)).toFixed(2)}
+              </div>
+            )}
+            <label>Currency</label>
+            <select name="currency" value={form.currency} onChange={handleChange}>
+              {currencies && currencies.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+            <label>Fund/Asset</label>
+            <input type="text" name="fund" list="fundListSell" value={form.fund} onChange={handleChange} placeholder="Choose asset" />
+            <datalist id="fundListSell">
+              {fundOptions.map((opt) => (
+                <option key={opt} value={opt} />
+              ))}
+            </datalist>
+            <label>Platform</label>
+            <input type="text" name="platform" list="platformListSell" value={form.platform} onChange={handleChange} placeholder="Choose platform" />
+            <datalist id="platformListSell">
+              {platformOptions.map((opt) => (
+                <option key={opt} value={opt} />
+              ))}
+            </datalist>
+            <label>Date</label>
+            <input type="date" name="date" value={form.date} onChange={handleChange} />
+            <button type="submit">Sell</button>
+          </form>
+        </div>
+      );
+    }
+
+    // Component to set or update the investment objective
+    function ObjectiveForm({ currencies, objective, onSave, prediction, isGeneratingPrediction, setIsGeneratingPrediction, setPrediction }) {
+      const [targetAmount, setTargetAmount] = useState(objective ? objective.targetAmount : '');
+      const [currency, setCurrency] = useState(objective ? objective.currency : (currencies && currencies[0]));
+      useEffect(() => {
+        if (objective) {
+          setTargetAmount(objective.targetAmount);
+          setCurrency(objective.currency);
+        }
+      }, [objective]);
+      useEffect(() => {
+        if (currencies && currencies.length > 0 && !currency) {
+          setCurrency(currencies[0]);
+        }
+      }, [currencies]);
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        const amt = parseFloat(targetAmount);
+        if (!isNaN(amt) && currency) {
+          onSave({ targetAmount: amt, currency });
+        }
+      };
+      return (
+        <div className="card">
+          <h2>Investment Objective</h2>
+          <form onSubmit={handleSubmit}>
+            <label>Target Amount</label>
+            <input type="number" step="0.01" value={targetAmount} onChange={(e) => setTargetAmount(e.target.value)} required />
+            <label>Currency</label>
+            <select value={currency} onChange={(e) => setCurrency(e.target.value)}>
+              {currencies && currencies.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+            <button type="submit">Save Objective</button>
+          </form>
+          {objective && (
+            <div style={{ marginTop: '10px' }}>
+              <strong>Current progress:</strong>
+              <div className="progress-bar">
+                <div className="progress-bar-fill" style={{ width: `${Math.min(100, (objective.currentTotal / objective.targetAmount) * 100)}%` }}></div>
+              </div>
+              <div style={{ marginTop: '4px' }}>
+                {objective.currentTotal.toFixed(2)} / {objective.targetAmount.toFixed(2)} {objective.currency}
+              </div>
+            </div>
+          )}
+          {/* Display the predicted time to reach the goal if available */}
+          {objective && (
+            <div style={{ marginTop: '10px' }}>
+              <strong>Predicted time to goal:</strong>
+              <div style={{ marginTop: '4px' }}>
+                {prediction ? prediction : 'No prediction available'}
+              </div>
+              <button 
+                type="button" 
+                className="prediction-button"
+                disabled={isGeneratingPrediction}
+                onClick={() => {
+                  setIsGeneratingPrediction(true);
+                  fetch('/api/prediction', { method: 'POST' })
+                    .then(() => {
+                      // Poll for the updated prediction
+                      const pollInterval = setInterval(() => {
+                        fetch('/api/prediction')
+                          .then((res) => res.json())
+                          .then((data) => {
+                            // Stop loading when prediction is complete and different from current
+                            if (data.prediction && data.prediction !== prediction && !data.isGenerating) {
+                              setPrediction(data.prediction);
+                              setIsGeneratingPrediction(false);
+                              clearInterval(pollInterval);
+                            }
+                            // Also stop if generation is no longer in progress but we have a prediction
+                            else if (data.prediction && !data.isGenerating) {
+                              setPrediction(data.prediction);
+                              setIsGeneratingPrediction(false);
+                              clearInterval(pollInterval);
+                            }
+                          })
+                          .catch(() => {
+                            setIsGeneratingPrediction(false);
+                            clearInterval(pollInterval);
+                          });
+                      }, 1000);
+                      // Stop polling after 60 seconds (give more time for Ollama)
+                      setTimeout(() => {
+                        clearInterval(pollInterval);
+                        setIsGeneratingPrediction(false);
+                      }, 60000);
+                    })
+                    .catch(() => {
+                      setIsGeneratingPrediction(false);
+                    });
+                }}
+                style={{ marginTop: '8px' }}
+              >
+                {isGeneratingPrediction && <span className="loading-spinner"></span>}
+                {isGeneratingPrediction ? 'Generating...' : 'Generate Prediction'}
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // Component to display a chart summarising investments by fund or platform
+    function InvestmentChart({ investments, rates, selectedCurrency, groupBy }) {
+      const canvasRef = useRef(null);
+      // Convert amounts into selected currency and group
+      function convertAmount(amount, from, to) {
+        if (!rates.rates[from] || !rates.rates[to]) return 0;
+        const amountInRON = amount * rates.rates[from];
+        return amountInRON / rates.rates[to];
+      }
+      // Compute current value per group (fund or platform).  When
+      // grouping by fund we determine the latest price and total
+      // units for each fund and multiply accordingly.  When grouping
+      // by platform we aggregate units across funds per platform and
+      // apply each fund's latest price.
+      const dataMap = {};
+      // Helper to convert a price from its original currency into the
+      // selected currency via RON.
+      function convertPrice(price, from, to) {
+        if (!rates.rates[from] || !rates.rates[to]) return 0;
+        const priceInRON = price * rates.rates[from];
+        return priceInRON / rates.rates[to];
+      }
+      // Precompute latest price and currency for each fund.  This
+      // mirrors the current value calculation by selecting the
+      // investment with the most recent date (and highest timestamp
+      // when dates are equal).
+      const byFund = {};
+      investments.forEach((inv) => {
+        if (!byFund[inv.fund]) byFund[inv.fund] = [];
+        byFund[inv.fund].push(inv);
+      });
+      const latestByFund = {};
+      for (const fund in byFund) {
+        const invs = byFund[fund];
+        let latestInv = null;
+        invs.forEach((inv) => {
+          if (!latestInv) {
+            latestInv = inv;
+            return;
+          }
+          if (inv.date > latestInv.date) {
+            latestInv = inv;
+          } else if (inv.date === latestInv.date) {
+            const currentTs = inv.timestamp != null ? inv.timestamp : parseInt(inv.id, 10);
+            const bestTs = latestInv.timestamp != null ? latestInv.timestamp : parseInt(latestInv.id, 10);
+            if (!isNaN(currentTs) && !isNaN(bestTs) && currentTs > bestTs) {
+              latestInv = inv;
+            }
+          }
+        });
+        let latestPrice = null;
+        let latestCur = null;
+        if (latestInv) {
+          if (typeof latestInv.unitPrice === 'number') {
+            latestPrice = latestInv.unitPrice;
+            latestCur = latestInv.currency;
+          } else if (typeof latestInv.units === 'number' && latestInv.units !== 0) {
+            latestPrice = latestInv.amount / latestInv.units;
+            latestCur = latestInv.currency;
+          }
+        }
+        latestByFund[fund] = latestPrice != null && latestCur != null ? { price: latestPrice, currency: latestCur } : null;
+      }
+      if (groupBy === 'fund') {
+        // For each fund compute total units and multiply by latest price
+        for (const fund in byFund) {
+          const invs = byFund[fund];
+          const latest = latestByFund[fund];
+          if (!latest) {
+            // Fallback: sum converted amounts
+            let sum = 0;
+            invs.forEach((inv) => {
+              sum += convertAmount(inv.amount, inv.currency, selectedCurrency);
+            });
+            dataMap[fund] = sum;
+            continue;
+          }
+          let totalUnits = 0;
+          invs.forEach((inv) => {
+            if (typeof inv.units === 'number') {
+              totalUnits += inv.units;
+            } else if (typeof inv.unitPrice === 'number' && inv.unitPrice !== 0) {
+              totalUnits += inv.amount / inv.unitPrice;
+            } else {
+              // Unknown units: convert amount to latest currency then divide by latest price
+              const conv = convertAmount(inv.amount, inv.currency, latest.currency);
+              totalUnits += conv / latest.price;
+            }
+          });
+          const valueInLatest = totalUnits * latest.price;
+          const valueInSelected = convertAmount(valueInLatest, latest.currency, selectedCurrency);
+          dataMap[fund] = valueInSelected;
+        }
+      } else {
+        // groupBy === 'platform'
+        // Accumulate units per platform and fund
+        const unitsByPlatform = {};
+        investments.forEach((inv) => {
+          const platform = inv.platform;
+          if (!unitsByPlatform[platform]) unitsByPlatform[platform] = {};
+          if (!unitsByPlatform[platform][inv.fund]) unitsByPlatform[platform][inv.fund] = 0;
+          let units = 0;
+          if (typeof inv.units === 'number') {
+            units = inv.units;
+          } else if (typeof inv.unitPrice === 'number' && inv.unitPrice !== 0) {
+            units = inv.amount / inv.unitPrice;
+          } else {
+            // Derive units using latest price of the fund
+            const latest = latestByFund[inv.fund];
+            if (latest) {
+              const conv = convertAmount(inv.amount, inv.currency, latest.currency);
+              units = conv / latest.price;
+            }
+          }
+          unitsByPlatform[platform][inv.fund] += units;
+        });
+        // For each platform compute total value across funds
+        for (const platform in unitsByPlatform) {
+          let sum = 0;
+          const fundsMap = unitsByPlatform[platform];
+          for (const fund in fundsMap) {
+            const units = fundsMap[fund];
+            const latest = latestByFund[fund];
+            if (latest) {
+              const valueInLatest = units * latest.price;
+              const valueInSelected = convertAmount(valueInLatest, latest.currency, selectedCurrency);
+              sum += valueInSelected;
+            }
+          }
+          dataMap[platform] = sum;
+        }
+      }
+      const labels = Object.keys(dataMap);
+      const values = labels.map((l) => dataMap[l]);
+      // Colour palette for charts
+      const colours = [
+        '#bb86fc', '#03dac6', '#ffb74d', '#81c784', '#64b5f6', '#e57373', '#aed581', '#9575cd', '#4db6ac', '#ba68c8'
+      ];
+      useEffect(() => {
+        if (!canvasRef.current) return;
+        // Destroy previous chart if any
+        if (canvasRef.current.chart) {
+          canvasRef.current.chart.destroy();
+        }
+        const ctx = canvasRef.current.getContext('2d');
+        canvasRef.current.chart = new Chart(ctx, {
+          type: 'doughnut',
+          data: {
+            labels: labels,
+            datasets: [
+              {
+                data: values,
+                backgroundColor: labels.map((_, i) => colours[i % colours.length]),
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: {
+                position: 'bottom',
+                labels: {
+                  color: '#e0e0e0',
+                },
+              },
+              title: {
+                display: true,
+                text: groupBy === 'fund' ? 'Portfolio by Fund' : 'Portfolio by Platform',
+                color: '#90caf9',
+              },
+            },
+          },
+        });
+      }, [investments, rates, selectedCurrency, groupBy]);
+      return (
+        <div className="card">
+          <h2>Distribution Chart</h2>
+          <div className="chart-container">
+            <canvas ref={canvasRef}></canvas>
+          </div>
+        </div>
+      );
+    }
+
+    // Component to show the evolution of a single asset over time.  It plots
+    // the unit price of the selected asset (converted to the currently
+    // selected currency) against the date of each transaction.  A line
+    // chart is used with discrete points marking purchase moments.
+    function AssetEvolutionChart({ investments, rates, selectedCurrency, selectedAsset }) {
+      const canvasRef = useRef(null);
+      // Helper to convert a price from its original currency into the
+      // selected currency.  Rates are in RON; convert via RON.
+      function convertPrice(price, from, to) {
+        if (!rates.rates[from] || !rates.rates[to]) return 0;
+        const priceInRON = price * rates.rates[from];
+        return priceInRON / rates.rates[to];
+      }
+      // Build arrays of dates and values for the selected asset
+      const assetInvs = investments
+        .filter((inv) => inv.fund === selectedAsset)
+        .sort((a, b) => (a.date < b.date ? -1 : 1));
+      const labels = assetInvs.map((inv) => inv.date);
+      // Array of converted prices for purchases (units >= 0)
+      const values = [];
+      // Array of converted prices for sales (units < 0).  A null is used
+      // for non‑sale positions to avoid drawing a connecting line.
+      const sellValues = [];
+      assetInvs.forEach((inv) => {
+        let price = null;
+        if (typeof inv.unitPrice === 'number') price = inv.unitPrice;
+        else if (typeof inv.units === 'number' && inv.units !== 0) price = inv.amount / inv.units;
+        else price = inv.amount;
+        const convertedPrice = convertPrice(price, inv.currency, selectedCurrency);
+        if (typeof inv.units === 'number' && inv.units < 0) {
+          // Sale
+          values.push(null);
+          sellValues.push(convertedPrice);
+        } else {
+          values.push(convertedPrice);
+          sellValues.push(null);
+        }
+      });
+      useEffect(() => {
+        if (!canvasRef.current) return;
+        if (canvasRef.current.chart) {
+          canvasRef.current.chart.destroy();
+        }
+        const ctx = canvasRef.current.getContext('2d');
+        const rootStyles = getComputedStyle(document.documentElement);
+        const headingColor = rootStyles.getPropertyValue('--heading-color').trim();
+        const textColor = rootStyles.getPropertyValue('--text-color').trim();
+        const borderColor = rootStyles.getPropertyValue('--border-color').trim();
+        const sellColor = rootStyles.getPropertyValue('--delete-color').trim();
+        canvasRef.current.chart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [
+              // Purchases dataset
+              {
+                label: `${selectedAsset} Buy`,
+                data: values,
+                borderColor: headingColor,
+                backgroundColor: `${headingColor}33`,
+                tension: 0.1,
+                fill: true,
+                pointRadius: 4,
+                pointBackgroundColor: headingColor,
+                pointBorderColor: headingColor,
+              },
+              // Sales dataset (draw only points, no line)
+              {
+                label: `${selectedAsset} Sell`,
+                data: sellValues,
+                borderColor: sellColor,
+                backgroundColor: sellColor,
+                pointRadius: 5,
+                pointStyle: 'triangle',
+                showLine: false,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: {
+                position: 'bottom',
+                labels: {
+                  color: textColor,
+                },
+              },
+              title: {
+                display: true,
+                text: `Price Evolution for ${selectedAsset}`,
+                color: headingColor,
+              },
+            },
+            scales: {
+              x: {
+                title: {
+                  display: true,
+                  text: 'Date',
+                  color: textColor,
+                },
+                ticks: {
+                  color: textColor,
+                },
+                grid: {
+                  color: borderColor,
+                },
+              },
+              y: {
+                title: {
+                  display: true,
+                  text: `Price per unit (${selectedCurrency})`,
+                  color: textColor,
+                },
+                ticks: {
+                  color: textColor,
+                },
+                grid: {
+                  color: borderColor,
+                },
+              },
+            },
+          },
+        });
+      }, [investments, rates, selectedCurrency, selectedAsset]);
+      if (assetInvs.length === 0) {
+        return (
+          <div className="card">
+            <h2>Asset Evolution</h2>
+            <p>No data for the selected asset.</p>
+          </div>
+        );
+      }
+      return (
+        <div className="card">
+          <h2>Asset Evolution</h2>
+          <div className="chart-container">
+            <canvas ref={canvasRef}></canvas>
+          </div>
+        </div>
+      );
+    }
+
+    // Main application component
+    function App() {
+      const [rates, setRates] = useState({ rates: {} });
+      const [currencies, setCurrencies] = useState([]);
+      const [investments, setInvestments] = useState([]);
+      const [objective, setObjective] = useState(null);
+      const [selectedCurrency, setSelectedCurrency] = useState('RON');
+      const [groupBy, setGroupBy] = useState('fund');
+      // Store the latest prediction returned from the backend.  This
+      // string is updated whenever a new investment is added,
+      // removed or the objective changes.  Initially it is null to
+      // indicate that no prediction has been fetched yet.
+      const [prediction, setPrediction] = useState(null);
+      const [isGeneratingPrediction, setIsGeneratingPrediction] = useState(false);
+
+      // Helper to fetch the current prediction from the server.  The
+      // endpoint returns an object with a `prediction` property.  If
+      // the value is null we keep the existing state so that the UI
+      // doesn't flash between "Calculating…" and "No prediction".
+      const updatePrediction = () => {
+        fetch('/api/prediction')
+          .then((res) => res.json())
+          .then((data) => {
+            if (data && Object.prototype.hasOwnProperty.call(data, 'prediction')) {
+              setPrediction(data.prediction);
+            }
+          })
+          .catch(() => {
+            // ignore errors silently
+          });
+      };
+
+      // Fetch rates, investments and objective on mount
+      useEffect(() => {
+        fetch('/api/rates')
+          .then((res) => res.json())
+          .then((data) => {
+            setRates(data);
+            setCurrencies(Object.keys(data.rates).sort());
+            // Default selected currency to RON if available
+            if (data.rates['RON']) {
+              setSelectedCurrency('RON');
+            }
+          });
+        fetch('/api/investments')
+          .then((res) => res.json())
+          .then((data) => setInvestments(data));
+        fetch('/api/objective')
+          .then((res) => res.json())
+          .then((data) => {
+            if (data) setObjective(data);
+          });
+        // Load existing prediction if available
+        updatePrediction();
+      }, []);
+
+      const handleAddInvestment = (inv) => {
+        fetch('/api/investments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(inv),
+        })
+          .then((res) => res.json())
+          .then((newInv) => {
+            setInvestments((prev) => [...prev, newInv]);
+          });
+      };
+
+      const handleSaveObjective = (obj) => {
+        fetch('/api/objective', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(obj),
+        })
+          .then((res) => res.json())
+          .then(() => {
+            // Recalculate current total by requesting objective again
+            fetch('/api/objective')
+              .then((res) => res.json())
+              .then((data) => setObjective(data));
+          });
+      };
+
+      // Convert amount helper
+      const convertAmount = (amount, from, to) => {
+        if (!rates.rates[from] || !rates.rates[to]) return 0;
+        const inRON = amount * rates.rates[from];
+        return inRON / rates.rates[to];
+      };
+      // Compute money invested and current portfolio value in the selected currency.
+      // Sum only purchase amounts to compute invested total.  Sales have
+      // negative units (and negative amounts) and should not reduce the
+      // invested sum.
+      const totalInvested = investments.reduce((sum, inv) => {
+        // Determine if this entry represents a sale: negative units or negative amount
+        const isSale = (typeof inv.units === 'number' && inv.units < 0) || inv.amount < 0;
+        if (isSale) return sum;
+        // Compute invested amount for purchases
+        const investedAmount = (typeof inv.unitPrice === 'number' && typeof inv.units === 'number') ? inv.unitPrice * inv.units : inv.amount;
+        return sum + convertAmount(investedAmount, inv.currency, selectedCurrency);
+      }, 0);
+      // Current portfolio value is the sum over each asset of (total units * latest unit price).
+      const currentValue = (() => {
+        const byFund = {};
+        investments.forEach((inv) => {
+          if (!byFund[inv.fund]) byFund[inv.fund] = [];
+          byFund[inv.fund].push(inv);
+        });
+        let total = 0;
+        for (const fund in byFund) {
+          const invs = byFund[fund];
+          // Determine the latest investment to get the last price.  Use
+          // the date as the primary key and fall back to the
+          // timestamp (or numeric id) to break ties when dates are
+          // equal.  This mirrors the backend logic so that both sides
+          // agree on what constitutes the “latest” entry.
+          let latestInv = null;
+          invs.forEach((inv) => {
+            if (!latestInv) {
+              latestInv = inv;
+              return;
+            }
+            if (inv.date > latestInv.date) {
+              latestInv = inv;
+            } else if (inv.date === latestInv.date) {
+              const currentTs = inv.timestamp != null ? inv.timestamp : parseInt(inv.id, 10);
+              const bestTs = latestInv.timestamp != null ? latestInv.timestamp : parseInt(latestInv.id, 10);
+              if (!isNaN(currentTs) && !isNaN(bestTs) && currentTs > bestTs) {
+                latestInv = inv;
+              }
+            }
+          });
+          let latestPrice = null;
+          let latestCurrency = null;
+          if (latestInv) {
+            if (typeof latestInv.unitPrice === 'number') {
+              latestPrice = latestInv.unitPrice;
+              latestCurrency = latestInv.currency;
+            } else if (typeof latestInv.units === 'number' && latestInv.units > 0) {
+              latestPrice = latestInv.amount / latestInv.units;
+              latestCurrency = latestInv.currency;
+            }
+          }
+          if (latestPrice == null || latestCurrency == null) {
+            // Fallback: sum converted amounts
+            invs.forEach((inv) => {
+              total += convertAmount(inv.amount, inv.currency, selectedCurrency);
+            });
+            continue;
+          }
+          // Sum units using latest price for unknown units
+          let totalUnits = 0;
+          invs.forEach((inv) => {
+            if (typeof inv.units === 'number') {
+              totalUnits += inv.units;
+            } else if (typeof inv.unitPrice === 'number') {
+              totalUnits += inv.amount / inv.unitPrice;
+            } else {
+              // unknown units: convert amount to latest currency then divide by price
+              const conv = convertAmount(inv.amount, inv.currency, latestCurrency);
+              totalUnits += conv / latestPrice;
+            }
+          });
+          const valueInLatest = latestPrice * totalUnits;
+          const value = convertAmount(valueInLatest, latestCurrency, selectedCurrency);
+          total += value;
+        }
+        return total;
+      })();
+
+      // Delete investment by id
+      const handleDelete = (id) => {
+        fetch('/api/investments/' + id, {
+          method: 'DELETE',
+        })
+          .then((res) => {
+            if (res.ok) {
+              setInvestments((prev) => prev.filter((inv) => inv.id !== id));
+            }
+          });
+      };
+
+      // Sell units handler.  Posts a negative units entry to the
+      // backend and updates local state upon success.  A sale is
+      // treated like any other investment but with a negative unit
+      // count which the server interprets as a sale.
+      const handleSellInvestment = (sale) => {
+        fetch('/api/investments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(sale),
+        })
+          .then((res) => res.json())
+          .then((newInv) => {
+            setInvestments((prev) => [...prev, newInv]);
+          });
+      };
+
+      // Compute unique funds/assets and platforms for datalist inputs and filters
+      const fundOptions = Array.from(new Set(investments.map((inv) => inv.fund))).filter((f) => f && f !== 'Unknown');
+      const platformOptions = Array.from(new Set(investments.map((inv) => inv.platform))).filter((p) => p && p !== 'Unknown');
+
+      // Asset options for evolution chart
+      const assetOptions = Array.from(new Set(investments.map((inv) => inv.fund))).filter((f) => f && f !== 'Unknown');
+      // Selected asset state; default to first available asset
+      const [selectedAsset, setSelectedAsset] = useState(assetOptions.length > 0 ? assetOptions[0] : '');
+      useEffect(() => {
+        if (assetOptions.length > 0 && !assetOptions.includes(selectedAsset)) {
+          setSelectedAsset(assetOptions[0]);
+        }
+      }, [assetOptions]);
+
+      // Filter states for date range and fund
+      const [startDateFilter, setStartDateFilter] = useState('');
+      const [endDateFilter, setEndDateFilter] = useState('');
+      const [fundFilter, setFundFilter] = useState('All');
+      const [pageSize] = useState(5);
+      const [currentPage, setCurrentPage] = useState(1);
+
+      // Reset pagination when filters or investments change
+      useEffect(() => {
+        setCurrentPage(1);
+      }, [startDateFilter, endDateFilter, fundFilter, investments]);
+
+      // Compute filtered investments based on filters
+      const filteredInvestments = investments.filter((inv) => {
+        // Filter by fund if selected
+        const fundMatches = fundFilter === 'All' || inv.fund === fundFilter;
+        // Filter by start date
+        const startMatches = !startDateFilter || inv.date >= startDateFilter;
+        // Filter by end date
+        const endMatches = !endDateFilter || inv.date <= endDateFilter;
+        return fundMatches && startMatches && endMatches;
+      });
+      // Pagination
+      const totalPages = Math.max(1, Math.ceil(filteredInvestments.length / pageSize));
+      const startIdx = (currentPage - 1) * pageSize;
+      const paginatedInvestments = filteredInvestments.slice(startIdx, startIdx + pageSize);
+
+      // Theme state: dark (default) or light.  A state flag controls a
+      // `light-theme` class on the body to switch CSS variables.  The
+      // toggleTheme function flips the flag.
+      const [isLightTheme, setIsLightTheme] = useState(false);
+      useEffect(() => {
+        if (isLightTheme) {
+          document.body.classList.add('light-theme');
+        } else {
+          document.body.classList.remove('light-theme');
+        }
+      }, [isLightTheme]);
+      const toggleTheme = () => setIsLightTheme((prev) => !prev);
+
+      // Compute units by fund and platform.  Sales (negative units)
+      // subtract from the total.  For entries without explicit units,
+      // derive the units from amount and unitPrice when possible; if
+      // neither is available, assume zero units for stats purposes.
+      const statsRows = (() => {
+        // Local helpers to convert amounts and prices to the selected currency
+        function convertAmountLocal(amount, from, to) {
+          if (!rates.rates[from] || !rates.rates[to]) return 0;
+          const inRon = amount * rates.rates[from];
+          return inRon / rates.rates[to];
+        }
+        function convertPriceLocal(price, from, to) {
+          if (!rates.rates[from] || !rates.rates[to]) return 0;
+          const priceInRon = price * rates.rates[from];
+          return priceInRon / rates.rates[to];
+        }
+        // Precompute latest price and currency per fund
+        const byFund = {};
+        investments.forEach((inv) => {
+          if (!byFund[inv.fund]) byFund[inv.fund] = [];
+          byFund[inv.fund].push(inv);
+        });
+        const latestByFund = {};
+        for (const fund in byFund) {
+          const invs = byFund[fund];
+          let latestInv = null;
+          invs.forEach((inv) => {
+            if (!latestInv) {
+              latestInv = inv;
+              return;
+            }
+            if (inv.date > latestInv.date) {
+              latestInv = inv;
+            } else if (inv.date === latestInv.date) {
+              const currentTs = inv.timestamp != null ? inv.timestamp : parseInt(inv.id, 10);
+              const bestTs = latestInv.timestamp != null ? latestInv.timestamp : parseInt(latestInv.id, 10);
+              if (!isNaN(currentTs) && !isNaN(bestTs) && currentTs > bestTs) {
+                latestInv = inv;
+              }
+            }
+          });
+          let price = null;
+          let cur = null;
+          if (latestInv) {
+            if (typeof latestInv.unitPrice === 'number') {
+              price = latestInv.unitPrice;
+              cur = latestInv.currency;
+            } else if (typeof latestInv.units === 'number' && latestInv.units !== 0) {
+              price = latestInv.amount / latestInv.units;
+              cur = latestInv.currency;
+            }
+          }
+          latestByFund[fund] = price != null && cur != null ? { price, currency: cur } : null;
+        }
+        const map = {};
+        investments.forEach((inv) => {
+          const key = inv.fund + '|' + inv.platform;
+          if (!map[key]) {
+            map[key] = { fund: inv.fund, platform: inv.platform, units: 0, unitPrice: null };
+          }
+          let units = 0;
+          if (typeof inv.units === 'number') {
+            units = inv.units;
+          } else if (typeof inv.unitPrice === 'number' && inv.unitPrice !== 0) {
+            units = inv.amount / inv.unitPrice;
+          } else {
+            // derive units using latest price for the fund
+            const latest = latestByFund[inv.fund];
+            if (latest) {
+              const conv = convertAmountLocal(inv.amount, inv.currency, latest.currency);
+              units = conv / latest.price;
+            }
+          }
+          map[key].units += units;
+        });
+        // Compute current unit price per fund in selected currency
+        Object.values(map).forEach((row) => {
+          const latest = latestByFund[row.fund];
+          if (latest) {
+            row.unitPrice = convertPriceLocal(latest.price, latest.currency, selectedCurrency);
+          }
+        });
+        return Object.values(map);
+      })();
+
+      // Export current investments to a JSON file.  Creates a blob
+      // containing the JSON and triggers a download.
+      const exportJSON = () => {
+        const dataStr = JSON.stringify(investments, null, 2);
+        const blob = new Blob([dataStr], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'investments.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      };
+      // Export current investments to an Excel file using SheetJS
+      const exportExcel = () => {
+        // Prepare a shallow copy without functions to avoid issues
+        const data = investments.map((inv) => ({ ...inv }));
+        const worksheet = XLSX.utils.json_to_sheet(data);
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'Investments');
+        XLSX.writeFile(workbook, 'investments.xlsx');
+      };
+      // Import investments from a selected file (JSON or Excel)
+      const handleFileImport = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const ext = file.name.split('.').pop().toLowerCase();
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const contents = event.target.result;
+          let imported = [];
+          if (ext === 'json') {
+            try {
+              imported = JSON.parse(contents);
+            } catch (err) {
+              alert('Invalid JSON file');
+              return;
+            }
+          } else if (ext === 'xls' || ext === 'xlsx') {
+            const data = new Uint8Array(contents);
+            const workbook = XLSX.read(data, { type: 'array' });
+            const firstSheet = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[firstSheet];
+            imported = XLSX.utils.sheet_to_json(worksheet);
+          } else {
+            alert('Unsupported file type');
+            return;
+          }
+          // Send imported investments to backend
+          fetch('/api/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ investments: imported }),
+          })
+            .then((res) => res.json())
+            .then((data) => {
+              // Reload investments from server
+              fetch('/api/investments')
+                .then((res) => res.json())
+                              .then((invData) => {
+                setInvestments(invData);
+              });
+            });
+        };
+        if (ext === 'json') {
+          reader.readAsText(file);
+        } else {
+          reader.readAsArrayBuffer(file);
+        }
+      };
+
+      return (
+        <div className="container">
+          <h1>Investment Tracker</h1>
+          {/* Theme toggle button: displays a sun when dark mode is active and a moon when light mode is active. */}
+          <button className="theme-toggle" aria-label={isLightTheme ? 'Switch to dark mode' : 'Switch to light mode'} onClick={toggleTheme}>
+            {isLightTheme ? '🌙' : '☀️'}
+          </button>
+          <div className="row">
+            <div className="col">
+              <InvestmentForm
+                currencies={currencies}
+                onAdd={handleAddInvestment}
+                fundOptions={fundOptions}
+                platformOptions={platformOptions}
+              />
+            </div>
+            <div className="col">
+              <SellForm
+                currencies={currencies}
+                onSell={handleSellInvestment}
+                fundOptions={fundOptions}
+                platformOptions={platformOptions}
+              />
+            </div>
+            <div className="col">
+              <ObjectiveForm 
+                currencies={currencies} 
+                objective={objective} 
+                onSave={handleSaveObjective} 
+                prediction={prediction}
+                isGeneratingPrediction={isGeneratingPrediction}
+                setIsGeneratingPrediction={setIsGeneratingPrediction}
+                setPrediction={setPrediction}
+              />
+            </div>
+          </div>
+          {/* Units summary per fund and platform */}
+          <div className="card">
+            <h2>Units by Fund and Platform</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>Fund</th>
+                  <th>Platform</th>
+                  <th>Units</th>
+                  <th>Current Unit Price ({selectedCurrency})</th>
+                </tr>
+              </thead>
+              <tbody>
+                {statsRows.map((row, idx) => (
+                  <tr key={idx}>
+                    <td>{row.fund}</td>
+                    <td>{row.platform}</td>
+                    <td>{row.units.toFixed(4)}</td>
+                    <td>{row.unitPrice != null ? row.unitPrice.toFixed(2) : '—'}</td>
+                  </tr>
+                ))}
+                {statsRows.length === 0 && (
+                  <tr>
+                    <td colSpan="4" style={{ textAlign: 'center' }}>No data</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          {/* Import and export controls */}
+          <div className="card">
+            <h2>Import / Export</h2>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+              <button onClick={exportJSON}>Export JSON</button>
+              <button onClick={exportExcel}>Export Excel</button>
+              <input type="file" accept=".json,.xls,.xlsx" onChange={handleFileImport} />
+            </div>
+          </div>
+          <div className="card">
+            <h2>Your Investments</h2>
+            {/* Filter controls */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', marginBottom: '10px' }}>
+              <div style={{ flex: '1 1 150px' }}>
+                <label>Start Date</label>
+                <input type="date" value={startDateFilter} onChange={(e) => setStartDateFilter(e.target.value)} />
+              </div>
+              <div style={{ flex: '1 1 150px' }}>
+                <label>End Date</label>
+                <input type="date" value={endDateFilter} onChange={(e) => setEndDateFilter(e.target.value)} />
+              </div>
+              <div style={{ flex: '1 1 200px' }}>
+                <label>Filter by Fund</label>
+                <select value={fundFilter} onChange={(e) => setFundFilter(e.target.value)}>
+                  <option value="All">All</option>
+                  {fundOptions.map((f) => (
+                    <option key={f} value={f}>{f}</option>
+                  ))}
+                </select>
+              </div>
+              <div style={{ flex: '1 1 200px' }}>
+                <label>Display Currency</label>
+                <select value={selectedCurrency} onChange={(e) => setSelectedCurrency(e.target.value)}>
+                  {currencies.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div style={{ marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '20px' }}>
+              <div><strong>Invested:</strong> {totalInvested.toFixed(2)} {selectedCurrency}</div>
+              <div><strong>Current Value:</strong> {currentValue.toFixed(2)} {selectedCurrency}</div>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Fund</th>
+                  <th>Platform</th>
+                  <th>Unit Price</th>
+                  <th>Units</th>
+                  <th>Amount</th>
+                  <th>Currency</th>
+                  <th>Value in {selectedCurrency}</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {paginatedInvestments.map((inv) => {
+                  const unitPrice = typeof inv.unitPrice === 'number' ? inv.unitPrice : (typeof inv.units === 'number' && inv.units > 0 ? inv.amount / inv.units : null);
+                    const units = typeof inv.units === 'number' ? inv.units : (typeof inv.unitPrice === 'number' && inv.unitPrice > 0 ? inv.amount / inv.unitPrice : null);
+                  return (
+                    <tr key={inv.id}>
+                      <td>{inv.date}</td>
+                      <td>{inv.fund}</td>
+                      <td>{inv.platform}</td>
+                      <td>{unitPrice != null ? unitPrice.toFixed(2) : '—'}</td>
+                      <td>{units != null ? units.toFixed(4) : '—'}</td>
+                      <td>{inv.amount.toFixed(2)}</td>
+                      <td>{inv.currency}</td>
+                      <td>{convertAmount(inv.amount, inv.currency, selectedCurrency).toFixed(2)}</td>
+                      <td><button className="delete-btn" onClick={() => handleDelete(inv.id)}>Delete</button></td>
+                    </tr>
+                  );
+                })}
+                {paginatedInvestments.length === 0 && (
+                  <tr>
+                    <td colSpan="9" style={{ textAlign: 'center' }}>No investments found.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+            {/* Pagination controls */}
+            <div className="pagination">
+              <button onClick={() => setCurrentPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1}>Previous</button>
+              <span>Page {currentPage} of {totalPages}</span>
+              <button onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>Next</button>
+            </div>
+          </div>
+          <div className="card">
+            <h2>Chart Options</h2>
+            <label>Group By</label>
+            <select value={groupBy} onChange={(e) => setGroupBy(e.target.value)}>
+              <option value="fund">Fund/Asset</option>
+              <option value="platform">Platform</option>
+            </select>
+          </div>
+          <InvestmentChart investments={filteredInvestments} rates={rates} selectedCurrency={selectedCurrency} groupBy={groupBy} />
+          {/* Asset evolution controls and chart */}
+          <div className="card">
+            <h2>Asset Evolution Options</h2>
+            <label>Select Asset</label>
+            <select value={selectedAsset} onChange={(e) => setSelectedAsset(e.target.value)}>
+              {assetOptions.map((asset) => (
+                <option key={asset} value={asset}>{asset}</option>
+              ))}
+            </select>
+          </div>
+          <AssetEvolutionChart investments={investments} rates={rates} selectedCurrency={selectedCurrency} selectedAsset={selectedAsset} />
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>

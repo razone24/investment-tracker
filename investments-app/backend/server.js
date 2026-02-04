@@ -22,6 +22,26 @@ const dataFile = path.join(__dirname, 'data.json');
 let investments = [];
 let objective = null;
 let rates = { date: null, rates: { RON: 1 } };
+let netWorth = { manualItems: [] };
+let milestones = [];
+let milestonesCurrency = 'RON';
+let profitTracker = {
+  entries: [],
+  settings: { minSalary: 4050, cassRate: 0.1, thresholds: [6, 12, 24], currency: 'RON' },
+};
+
+const defaultNetWorthItems = () => ([
+  { id: 'nw-realestate', name: 'RealEstate', type: 'asset', value: 0, currency: 'RON' },
+  { id: 'nw-retirement', name: 'Retirement', type: 'asset', value: 0, currency: 'RON' },
+  { id: 'nw-bonds', name: 'Bonds', type: 'asset', value: 0, currency: 'RON' },
+  { id: 'nw-stocks', name: 'Stocks', type: 'asset', value: 0, currency: 'RON' },
+  { id: 'nw-crypto', name: 'Crypto', type: 'asset', value: 0, currency: 'RON' },
+  { id: 'nw-cash', name: 'Cash/HYSA', type: 'asset', value: 0, currency: 'RON' },
+  { id: 'nw-cc-debt', name: 'CC Debt', type: 'liability', value: 0, currency: 'RON' },
+  { id: 'nw-mortgage', name: 'Mortgage', type: 'liability', value: 0, currency: 'RON' },
+]);
+
+const defaultProfitSettings = () => ({ minSalary: 4050, cassRate: 0.1, thresholds: [6, 12, 24], currency: 'RON' });
 
 // Store the latest prediction returned by the LLM.  This value will be
 // returned to the client via the /api/prediction endpoint.  A small
@@ -351,9 +371,50 @@ function loadData() {
       // Sort investments by timestamp in descending order (newest first) when loading
       investments.sort((a, b) => b.timestamp - a.timestamp);
       objective = parsed.objective || null;
+      netWorth = parsed.netWorth || { manualItems: [] };
+      milestonesCurrency = typeof parsed.milestonesCurrency === 'string' && parsed.milestonesCurrency ? parsed.milestonesCurrency : 'RON';
+      if (!Array.isArray(netWorth.manualItems) || netWorth.manualItems.length === 0) {
+        netWorth.manualItems = defaultNetWorthItems();
+      }
+      milestones = Array.isArray(parsed.milestones) ? parsed.milestones : [];
+      profitTracker = parsed.profitTracker || { entries: [], settings: defaultProfitSettings() };
+      if (!Array.isArray(profitTracker.entries)) {
+        profitTracker.entries = [];
+      }
+      if (!profitTracker.settings || typeof profitTracker.settings !== 'object') {
+        profitTracker.settings = defaultProfitSettings();
+      } else {
+        const defaults = defaultProfitSettings();
+        if (typeof profitTracker.settings.minSalary !== 'number') {
+          profitTracker.settings.minSalary = defaults.minSalary;
+        }
+        if (typeof profitTracker.settings.cassRate !== 'number') {
+          profitTracker.settings.cassRate = defaults.cassRate;
+        }
+        if (typeof profitTracker.settings.currency !== 'string' || !profitTracker.settings.currency) {
+          profitTracker.settings.currency = defaults.currency;
+        }
+        if (!Array.isArray(profitTracker.settings.thresholds) || profitTracker.settings.thresholds.length === 0) {
+          profitTracker.settings.thresholds = defaults.thresholds;
+        }
+      }
     }
   } catch (err) {
     console.error('Error reading data file:', err);
+  }
+  if (!Array.isArray(netWorth.manualItems) || netWorth.manualItems.length === 0) {
+    netWorth.manualItems = defaultNetWorthItems();
+  }
+  if (!profitTracker || typeof profitTracker !== 'object') {
+    profitTracker = { entries: [], settings: defaultProfitSettings() };
+  }
+  if (!Array.isArray(profitTracker.entries)) {
+    profitTracker.entries = [];
+  }
+  if (!profitTracker.settings || typeof profitTracker.settings !== 'object') {
+    profitTracker.settings = defaultProfitSettings();
+  } else if (typeof profitTracker.settings.currency !== 'string' || !profitTracker.settings.currency) {
+    profitTracker.settings.currency = defaultProfitSettings().currency;
   }
 }
 
@@ -364,7 +425,7 @@ function loadData() {
  */
 function saveData() {
   try {
-    const payload = JSON.stringify({ investments, objective }, null, 2);
+    const payload = JSON.stringify({ investments, objective, netWorth, milestones, milestonesCurrency, profitTracker }, null, 2);
     fs.writeFileSync(dataFile, payload);
   } catch (err) {
     console.error('Error writing data file:', err);
@@ -758,6 +819,101 @@ function routeApi(pathName, method, body, res) {
       };
       saveData();
       return sendJson(res, 200, objective);
+    }
+  }
+  if (pathName === '/api/net-worth') {
+    if (method === 'GET') {
+      return sendJson(res, 200, netWorth);
+    } else if (method === 'POST') {
+      if (!body || !Array.isArray(body.manualItems)) {
+        return sendJson(res, 400, { error: 'Invalid net worth payload' });
+      }
+      const cleaned = body.manualItems.map((item, idx) => {
+        const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : `Item ${idx + 1}`;
+        const type = item.type === 'liability' ? 'liability' : 'asset';
+        const value = typeof item.value === 'number' ? item.value : parseFloat(item.value);
+        const currency = typeof item.currency === 'string' && item.currency ? item.currency.toUpperCase() : 'RON';
+        const id = typeof item.id === 'string' && item.id ? item.id : `${Date.now()}-${idx}`;
+        return {
+          id,
+          name,
+          type,
+          value: isNaN(value) ? 0 : value,
+          currency,
+        };
+      });
+      netWorth = { ...netWorth, manualItems: cleaned };
+      saveData();
+      return sendJson(res, 200, netWorth);
+    }
+  }
+  if (pathName === '/api/milestones') {
+    if (method === 'GET') {
+      return sendJson(res, 200, { milestones, currency: milestonesCurrency });
+    } else if (method === 'POST') {
+      if (!body || !Array.isArray(body.milestones)) {
+        return sendJson(res, 400, { error: 'Invalid milestones payload' });
+      }
+      milestones = body.milestones.map((item, idx) => {
+        const target = typeof item.target === 'number' ? item.target : parseFloat(item.target);
+        const targetDate = typeof item.targetDate === 'string' ? item.targetDate : '';
+        const id = typeof item.id === 'string' && item.id ? item.id : `${Date.now()}-${idx}`;
+        return {
+          id,
+          target: isNaN(target) ? 0 : target,
+          targetDate,
+        };
+      });
+      if (body.currency && typeof body.currency === 'string') {
+        milestonesCurrency = body.currency.toUpperCase();
+      }
+      saveData();
+      return sendJson(res, 200, { milestones, currency: milestonesCurrency });
+    }
+  }
+  if (pathName === '/api/profit') {
+    if (method === 'GET') {
+      return sendJson(res, 200, profitTracker);
+    } else if (method === 'POST') {
+      if (!body || (body.entries && !Array.isArray(body.entries))) {
+        return sendJson(res, 400, { error: 'Invalid profit payload' });
+      }
+      if (Array.isArray(body.entries)) {
+        profitTracker.entries = body.entries.map((item, idx) => {
+          const amount = typeof item.amount === 'number' ? item.amount : parseFloat(item.amount);
+          const date = typeof item.date === 'string' ? item.date : '';
+          const name = typeof item.name === 'string' ? item.name : '';
+          const comment = typeof item.comment === 'string' ? item.comment : '';
+          const id = typeof item.id === 'string' && item.id ? item.id : `${Date.now()}-${idx}`;
+          return {
+            id,
+            date,
+            amount: isNaN(amount) ? 0 : amount,
+            name,
+            comment,
+          };
+        });
+      }
+      if (body.settings && typeof body.settings === 'object') {
+        const next = { ...profitTracker.settings };
+        if (body.settings.minSalary != null) {
+          const minSalary = typeof body.settings.minSalary === 'number' ? body.settings.minSalary : parseFloat(body.settings.minSalary);
+          if (!isNaN(minSalary)) next.minSalary = minSalary;
+        }
+        if (body.settings.cassRate != null) {
+          const cassRate = typeof body.settings.cassRate === 'number' ? body.settings.cassRate : parseFloat(body.settings.cassRate);
+          if (!isNaN(cassRate)) next.cassRate = cassRate;
+        }
+        if (body.settings.currency && typeof body.settings.currency === 'string') {
+          next.currency = body.settings.currency.toUpperCase();
+        }
+        if (Array.isArray(body.settings.thresholds) && body.settings.thresholds.length > 0) {
+          next.thresholds = body.settings.thresholds.map((t) => (typeof t === 'number' ? t : parseFloat(t))).filter((t) => !isNaN(t));
+        }
+        profitTracker.settings = next;
+      }
+      saveData();
+      return sendJson(res, 200, profitTracker);
     }
   }
   // Import a set of investments from a JSON payload.  The body

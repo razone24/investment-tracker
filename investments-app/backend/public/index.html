@@ -142,6 +142,18 @@
     thead tr {
       background-color: var(--card-bg-color);
     }
+    .table-wrapper {
+      width: 100%;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .section-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
     .row {
       display: flex;
       flex-wrap: wrap;
@@ -206,6 +218,33 @@
     .prediction-button:disabled {
       opacity: 0.6;
       cursor: not-allowed;
+    }
+
+    @media (max-width: 900px) {
+      .container {
+        padding: 12px;
+      }
+      .row {
+        flex-direction: column;
+      }
+      .col {
+        flex: 1 1 100%;
+      }
+      .card {
+        padding: 14px;
+      }
+      input, select, button {
+        font-size: 16px;
+      }
+      .pagination {
+        flex-wrap: wrap;
+      }
+      .chart-container {
+        height: 280px;
+      }
+      table {
+        min-width: 620px;
+      }
     }
   </style>
   <!-- Load React and other dependencies from CDNs -->
@@ -836,6 +875,17 @@
       // indicate that no prediction has been fetched yet.
       const [prediction, setPrediction] = useState(null);
       const [isGeneratingPrediction, setIsGeneratingPrediction] = useState(false);
+      const [netWorthItems, setNetWorthItems] = useState([]);
+      const [netWorthDirty, setNetWorthDirty] = useState(false);
+      const [netWorthCurrency, setNetWorthCurrency] = useState('RON');
+      const [milestones, setMilestones] = useState([]);
+      const [milestonesDirty, setMilestonesDirty] = useState(false);
+      const [milestonesCurrency, setMilestonesCurrency] = useState('RON');
+      const [profitEntries, setProfitEntries] = useState([]);
+      const [profitSettings, setProfitSettings] = useState({ minSalary: 4050, cassRate: 0.1, thresholds: [6, 12, 24], currency: 'RON' });
+      const [profitDirty, setProfitDirty] = useState(false);
+      const [profitCurrency, setProfitCurrency] = useState('RON');
+      const [swrCurrency, setSwrCurrency] = useState('RON');
 
       // Helper to fetch the current prediction from the server.  The
       // endpoint returns an object with a `prediction` property.  If
@@ -864,6 +914,10 @@
             // Default selected currency to RON if available
             if (data.rates['RON']) {
               setSelectedCurrency('RON');
+              setNetWorthCurrency('RON');
+              setMilestonesCurrency('RON');
+              setProfitCurrency('RON');
+              setSwrCurrency('RON');
             }
           });
         fetch('/api/investments')
@@ -873,6 +927,47 @@
           .then((res) => res.json())
           .then((data) => {
             if (data) setObjective(data);
+          });
+        fetch('/api/net-worth')
+          .then((res) => res.json())
+          .then((data) => {
+            if (data && Array.isArray(data.manualItems)) {
+              setNetWorthItems(data.manualItems);
+            }
+          })
+          .catch(() => {
+            // ignore errors silently
+          });
+        fetch('/api/milestones')
+          .then((res) => res.json())
+          .then((data) => {
+            const list = Array.isArray(data) ? data : data && Array.isArray(data.milestones) ? data.milestones : [];
+            setMilestones(list);
+            if (data && typeof data.currency === 'string') {
+              setMilestonesCurrency(data.currency);
+            }
+          })
+          .catch(() => {
+            // ignore errors silently
+          });
+        fetch('/api/profit')
+          .then((res) => res.json())
+          .then((data) => {
+            if (data && Array.isArray(data.entries)) {
+              setProfitEntries(data.entries);
+            }
+            if (data && data.settings) {
+              setProfitSettings((prev) => ({
+                ...prev,
+                ...data.settings,
+              }));
+              if (typeof data.settings.currency === 'string') {
+                setProfitCurrency(data.settings.currency);
+              }
+            }
+          })
+          .catch(() => {
+            // ignore errors silently
           });
         // Load existing prediction if available
         updatePrediction();
@@ -905,26 +1000,66 @@
           });
       };
 
+      const saveNetWorth = (items) => {
+        fetch('/api/net-worth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ manualItems: items }),
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            if (data && Array.isArray(data.manualItems)) {
+              setNetWorthItems(data.manualItems);
+              setNetWorthDirty(false);
+            }
+          });
+      };
+
+      const saveMilestones = (items) => {
+        fetch('/api/milestones', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ milestones: items, currency: milestonesCurrency }),
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            const list = Array.isArray(data) ? data : data && Array.isArray(data.milestones) ? data.milestones : [];
+            setMilestones(list);
+            if (data && typeof data.currency === 'string') {
+              setMilestonesCurrency(data.currency);
+            }
+            setMilestonesDirty(false);
+          });
+      };
+
+      const saveProfitTracker = (entries, settings) => {
+        fetch('/api/profit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entries, settings: { ...settings, currency: profitCurrency } }),
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            if (data && Array.isArray(data.entries)) {
+              setProfitEntries(data.entries);
+            }
+            if (data && data.settings) {
+              setProfitSettings((prev) => ({ ...prev, ...data.settings }));
+              if (typeof data.settings.currency === 'string') {
+                setProfitCurrency(data.settings.currency);
+              }
+            }
+            setProfitDirty(false);
+          });
+      };
+
       // Convert amount helper
       const convertAmount = (amount, from, to) => {
         if (!rates.rates[from] || !rates.rates[to]) return 0;
         const inRON = amount * rates.rates[from];
         return inRON / rates.rates[to];
       };
-      // Compute money invested and current portfolio value in the selected currency.
-      // Sum only purchase amounts to compute invested total.  Sales have
-      // negative units (and negative amounts) and should not reduce the
-      // invested sum.
-      const totalInvested = investments.reduce((sum, inv) => {
-        // Determine if this entry represents a sale: negative units or negative amount
-        const isSale = (typeof inv.units === 'number' && inv.units < 0) || inv.amount < 0;
-        if (isSale) return sum;
-        // Compute invested amount for purchases
-        const investedAmount = (typeof inv.unitPrice === 'number' && typeof inv.units === 'number') ? inv.unitPrice * inv.units : inv.amount;
-        return sum + convertAmount(investedAmount, inv.currency, selectedCurrency);
-      }, 0);
-      // Current portfolio value is the sum over each asset of (total units * latest unit price).
-      const currentValue = (() => {
+      const getCurrentValue = (targetCurrency) => {
         const byFund = {};
         investments.forEach((inv) => {
           if (!byFund[inv.fund]) byFund[inv.fund] = [];
@@ -933,11 +1068,6 @@
         let total = 0;
         for (const fund in byFund) {
           const invs = byFund[fund];
-          // Determine the latest investment to get the last price.  Use
-          // the date as the primary key and fall back to the
-          // timestamp (or numeric id) to break ties when dates are
-          // equal.  This mirrors the backend logic so that both sides
-          // agree on what constitutes the “latest” entry.
           let latestInv = null;
           invs.forEach((inv) => {
             if (!latestInv) {
@@ -966,13 +1096,11 @@
             }
           }
           if (latestPrice == null || latestCurrency == null) {
-            // Fallback: sum converted amounts
             invs.forEach((inv) => {
-              total += convertAmount(inv.amount, inv.currency, selectedCurrency);
+              total += convertAmount(inv.amount, inv.currency, targetCurrency);
             });
             continue;
           }
-          // Sum units using latest price for unknown units
           let totalUnits = 0;
           invs.forEach((inv) => {
             if (typeof inv.units === 'number') {
@@ -980,17 +1108,126 @@
             } else if (typeof inv.unitPrice === 'number') {
               totalUnits += inv.amount / inv.unitPrice;
             } else {
-              // unknown units: convert amount to latest currency then divide by price
               const conv = convertAmount(inv.amount, inv.currency, latestCurrency);
               totalUnits += conv / latestPrice;
             }
           });
           const valueInLatest = latestPrice * totalUnits;
-          const value = convertAmount(valueInLatest, latestCurrency, selectedCurrency);
+          const value = convertAmount(valueInLatest, latestCurrency, targetCurrency);
           total += value;
         }
         return total;
+      };
+      // Compute money invested and current portfolio value in the selected currency.
+      // Sum only purchase amounts to compute invested total.  Sales have
+      // negative units (and negative amounts) and should not reduce the
+      // invested sum.
+      const totalInvested = investments.reduce((sum, inv) => {
+        // Determine if this entry represents a sale: negative units or negative amount
+        const isSale = (typeof inv.units === 'number' && inv.units < 0) || inv.amount < 0;
+        if (isSale) return sum;
+        // Compute invested amount for purchases
+        const investedAmount = (typeof inv.unitPrice === 'number' && typeof inv.units === 'number') ? inv.unitPrice * inv.units : inv.amount;
+        return sum + convertAmount(investedAmount, inv.currency, selectedCurrency);
+      }, 0);
+      // Current portfolio value is the sum over each asset of (total units * latest unit price).
+      const currentValue = getCurrentValue(selectedCurrency);
+
+      const formatDate = (date) => {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+      };
+
+      const getManualTotals = (targetCurrency) => {
+        return netWorthItems.reduce(
+          (acc, item) => {
+            const raw = typeof item.value === 'number' ? item.value : parseFloat(item.value);
+            const value = isNaN(raw) ? 0 : convertAmount(raw, item.currency || targetCurrency, targetCurrency);
+            if (item.type === 'liability') {
+              acc.liabilities += value;
+            } else {
+              acc.assets += value;
+            }
+            if (typeof item.name === 'string' && item.name.toLowerCase().includes('retirement')) {
+              acc.retirement += value;
+            }
+            return acc;
+          },
+          { assets: 0, liabilities: 0, retirement: 0 }
+        );
+      };
+
+      const manualTotals = getManualTotals(netWorthCurrency);
+      const netWorthCurrentValue = getCurrentValue(netWorthCurrency);
+      const netWorthTotal = netWorthCurrentValue + manualTotals.assets - manualTotals.liabilities;
+
+      const swrTotals = getManualTotals(swrCurrency);
+      const swrCurrentValue = getCurrentValue(swrCurrency);
+      const portfolioPlusRetirement = swrCurrentValue + swrTotals.retirement;
+      const milestoneCurrentValue = getCurrentValue(milestonesCurrency);
+
+      const avgMonthlyContribution = (() => {
+        if (investments.length === 0) return 0;
+        const now = new Date();
+        const monthsBack = 12;
+        const windowStart = new Date(now.getFullYear(), now.getMonth() - (monthsBack - 1), 1);
+        const windowStartStr = formatDate(windowStart);
+        let total = 0;
+        investments.forEach((inv) => {
+          if (!inv.date || inv.date < windowStartStr) return;
+          const isSale = (typeof inv.units === 'number' && inv.units < 0) || inv.amount < 0;
+          if (isSale) return;
+          const investedAmount =
+            typeof inv.unitPrice === 'number' && typeof inv.units === 'number'
+              ? inv.unitPrice * inv.units
+              : inv.amount;
+          total += convertAmount(investedAmount, inv.currency, milestonesCurrency);
+        });
+        return total / monthsBack;
       })();
+
+      const estimateMilestone = (target) => {
+        const numericTarget = typeof target === 'number' ? target : parseFloat(target);
+        if (!numericTarget || isNaN(numericTarget)) {
+          return { status: '—', dateReached: '', estDate: '', monthsRemaining: null };
+        }
+        if (milestoneCurrentValue >= numericTarget) {
+          return { status: 'Reached', dateReached: formatDate(new Date()), estDate: '', monthsRemaining: 0 };
+        }
+        if (avgMonthlyContribution <= 0) {
+          return { status: 'No estimate', dateReached: '', estDate: '', monthsRemaining: null };
+        }
+        const remaining = numericTarget - milestoneCurrentValue;
+        const months = Math.max(1, Math.ceil(remaining / avgMonthlyContribution));
+        const est = new Date();
+        est.setMonth(est.getMonth() + months);
+        return { status: 'In progress', dateReached: '', estDate: formatDate(est), monthsRemaining: months };
+      };
+
+      const calcCassDue = (profit) => {
+        const minSalary = typeof profitSettings.minSalary === 'number' ? profitSettings.minSalary : parseFloat(profitSettings.minSalary);
+        const rate = typeof profitSettings.cassRate === 'number' ? profitSettings.cassRate : parseFloat(profitSettings.cassRate);
+        const thresholds = Array.isArray(profitSettings.thresholds) && profitSettings.thresholds.length > 0 ? profitSettings.thresholds : [6, 12, 24];
+        if (!minSalary || !rate || isNaN(minSalary) || isNaN(rate)) return 0;
+        const sorted = [...thresholds].sort((a, b) => a - b);
+        const t1 = minSalary * sorted[0];
+        const t2 = minSalary * (sorted[1] || sorted[0]);
+        const t3 = minSalary * (sorted[2] || sorted[1] || sorted[0]);
+        if (profit < t1) return 0;
+        if (profit < t2) return t1 * rate;
+        if (profit < t3) return t2 * rate;
+        return t3 * rate;
+      };
+
+      const profitByYear = profitEntries.reduce((acc, entry) => {
+        const year = entry.date ? entry.date.slice(0, 4) : 'Unknown';
+        const amount = typeof entry.amount === 'number' ? entry.amount : parseFloat(entry.amount);
+        acc[year] = (acc[year] || 0) + (isNaN(amount) ? 0 : amount);
+        return acc;
+      }, {});
+      const profitYears = Object.keys(profitByYear).sort();
 
       // Delete investment by id
       const handleDelete = (id) => {
@@ -1018,6 +1255,86 @@
           .then((newInv) => {
             setInvestments((prev) => [...prev, newInv]);
           });
+      };
+
+      const updateNetWorthItem = (id, patch) => {
+        setNetWorthItems((prev) =>
+          prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
+        );
+        setNetWorthDirty(true);
+      };
+
+      const addNetWorthItem = () => {
+        const id = `nw-${Date.now()}`;
+        setNetWorthItems((prev) => [
+          ...prev,
+          { id, name: 'New Item', type: 'asset', value: 0, currency: netWorthCurrency || 'RON' },
+        ]);
+        setNetWorthDirty(true);
+      };
+
+      const removeNetWorthItem = (id) => {
+        setNetWorthItems((prev) => prev.filter((item) => item.id !== id));
+        setNetWorthDirty(true);
+      };
+
+      const updateMilestone = (id, patch) => {
+        setMilestones((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+        setMilestonesDirty(true);
+      };
+
+      const addMilestone = () => {
+        const id = `ms-${Date.now()}`;
+        setMilestones((prev) => [...prev, { id, target: 0, targetDate: '' }]);
+        setMilestonesDirty(true);
+      };
+
+      const removeMilestone = (id) => {
+        setMilestones((prev) => prev.filter((m) => m.id !== id));
+        setMilestonesDirty(true);
+      };
+
+      const handleMilestonesCurrencyChange = (nextCurrency) => {
+        if (!nextCurrency || nextCurrency === milestonesCurrency) return;
+        setMilestones((prev) =>
+          prev.map((m) => {
+            const raw = typeof m.target === 'number' ? m.target : parseFloat(m.target);
+            const converted = isNaN(raw) ? 0 : convertAmount(raw, milestonesCurrency, nextCurrency);
+            return { ...m, target: converted };
+          })
+        );
+        setMilestonesCurrency(nextCurrency);
+        setMilestonesDirty(true);
+      };
+
+      const updateProfitEntry = (id, patch) => {
+        setProfitEntries((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+        setProfitDirty(true);
+      };
+
+      const addProfitEntry = () => {
+        const id = `pf-${Date.now()}`;
+        setProfitEntries((prev) => [...prev, { id, date: formatDate(new Date()), amount: 0, name: '', comment: '' }]);
+        setProfitDirty(true);
+      };
+
+      const removeProfitEntry = (id) => {
+        setProfitEntries((prev) => prev.filter((e) => e.id !== id));
+        setProfitDirty(true);
+      };
+
+      const handleProfitCurrencyChange = (nextCurrency) => {
+        if (!nextCurrency || nextCurrency === profitCurrency) return;
+        setProfitEntries((prev) =>
+          prev.map((e) => {
+            const raw = typeof e.amount === 'number' ? e.amount : parseFloat(e.amount);
+            const converted = isNaN(raw) ? 0 : convertAmount(raw, profitCurrency, nextCurrency);
+            return { ...e, amount: converted };
+          })
+        );
+        setProfitCurrency(nextCurrency);
+        setProfitSettings((prev) => ({ ...prev, currency: nextCurrency }));
+        setProfitDirty(true);
       };
 
       // Compute unique funds/assets and platforms for datalist inputs and filters
@@ -1270,7 +1587,8 @@
           {/* Units summary per fund and platform */}
           <div className="card">
             <h2>Units by Fund and Platform</h2>
-            <table>
+            <div className="table-wrapper">
+              <table>
               <thead>
                 <tr>
                   <th>Fund</th>
@@ -1294,7 +1612,8 @@
                   </tr>
                 )}
               </tbody>
-            </table>
+              </table>
+            </div>
           </div>
           {/* Import and export controls */}
           <div className="card">
@@ -1339,7 +1658,8 @@
               <div><strong>Invested:</strong> {totalInvested.toFixed(2)} {selectedCurrency}</div>
               <div><strong>Current Value:</strong> {currentValue.toFixed(2)} {selectedCurrency}</div>
             </div>
-            <table>
+            <div className="table-wrapper">
+              <table>
               <thead>
                 <tr>
                   <th>Date</th>
@@ -1377,7 +1697,8 @@
                   </tr>
                 )}
               </tbody>
-            </table>
+              </table>
+            </div>
             {/* Pagination controls */}
             <div className="pagination">
               <button onClick={() => setCurrentPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1}>Previous</button>
@@ -1405,6 +1726,361 @@
             </select>
           </div>
           <AssetEvolutionChart investments={investments} rates={rates} selectedCurrency={selectedCurrency} selectedAsset={selectedAsset} />
+          <div className="card">
+            <h2>Net Worth</h2>
+            <div className="section-controls">
+              <div>
+                <label>Display Currency</label>
+                <select value={netWorthCurrency} onChange={(e) => setNetWorthCurrency(e.target.value)}>
+                  {currencies.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div style={{ marginBottom: '10px' }}>
+              <div><strong>Portfolio value:</strong> {netWorthCurrentValue.toFixed(2)} {netWorthCurrency}</div>
+              <div><strong>Manual assets:</strong> {manualTotals.assets.toFixed(2)} {netWorthCurrency}</div>
+              <div><strong>Manual liabilities:</strong> {manualTotals.liabilities.toFixed(2)} {netWorthCurrency}</div>
+              <div><strong>Total net worth:</strong> {netWorthTotal.toFixed(2)} {netWorthCurrency}</div>
+            </div>
+            <div className="table-wrapper">
+              <table>
+              <thead>
+                <tr>
+                  <th>Category</th>
+                  <th>Type</th>
+                  <th>Value</th>
+                  <th>Currency</th>
+                  <th>Value in {netWorthCurrency}</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {netWorthItems.map((item) => (
+                  <tr key={item.id}>
+                    <td>
+                      <input
+                        value={item.name || ''}
+                        onChange={(e) => updateNetWorthItem(item.id, { name: e.target.value })}
+                      />
+                    </td>
+                    <td>
+                      <select
+                        value={item.type || 'asset'}
+                        onChange={(e) => updateNetWorthItem(item.id, { type: e.target.value })}
+                      >
+                        <option value="asset">Asset</option>
+                        <option value="liability">Liability</option>
+                      </select>
+                    </td>
+                    <td>
+                      <input
+                        type="number"
+                        value={item.value}
+                        onChange={(e) => {
+                          const nextValue = parseFloat(e.target.value);
+                          updateNetWorthItem(item.id, { value: isNaN(nextValue) ? 0 : nextValue });
+                        }}
+                      />
+                    </td>
+                    <td>
+                      <select
+                        value={item.currency || netWorthCurrency}
+                        onChange={(e) => updateNetWorthItem(item.id, { currency: e.target.value })}
+                      >
+                        {currencies.map((c) => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
+                      </select>
+                    </td>
+                    <td>
+                      {(() => {
+                        const raw = typeof item.value === 'number' ? item.value : parseFloat(item.value);
+                        const valueInSelected = isNaN(raw)
+                          ? 0
+                          : convertAmount(raw, item.currency || netWorthCurrency, netWorthCurrency);
+                        return Number.isFinite(valueInSelected) ? valueInSelected.toFixed(2) : '0.00';
+                      })()}
+                    </td>
+                    <td>
+                      <button className="delete-btn" onClick={() => removeNetWorthItem(item.id)}>Remove</button>
+                    </td>
+                  </tr>
+                ))}
+                {netWorthItems.length === 0 && (
+                  <tr>
+                    <td colSpan="6" style={{ textAlign: 'center' }}>No manual items yet.</td>
+                  </tr>
+                )}
+              </tbody>
+              </table>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', marginTop: '10px', flexWrap: 'wrap' }}>
+              <button onClick={addNetWorthItem}>Add Item</button>
+              <button onClick={() => saveNetWorth(netWorthItems)} disabled={!netWorthDirty}>Save Net Worth</button>
+            </div>
+          </div>
+          <div className="card">
+            <h2>Milestones</h2>
+            <div className="section-controls">
+              <div>
+                <label>Display Currency</label>
+                <select value={milestonesCurrency} onChange={(e) => handleMilestonesCurrencyChange(e.target.value)}>
+                  {currencies.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div style={{ marginBottom: '10px' }}>
+              <div><strong>Avg monthly contribution (last 12 months):</strong> {avgMonthlyContribution.toFixed(2)} {milestonesCurrency}</div>
+              <div><strong>Current portfolio value:</strong> {milestoneCurrentValue.toFixed(2)} {milestonesCurrency}</div>
+            </div>
+            <div className="table-wrapper">
+              <table>
+              <thead>
+                <tr>
+                  <th>Target ({milestonesCurrency})</th>
+                  <th>Target Date</th>
+                  <th>Status</th>
+                  <th>Date Reached</th>
+                  <th>EST</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {milestones.map((m) => {
+                  const est = estimateMilestone(m.target);
+                  const estLabel = est.estDate
+                    ? est.monthsRemaining != null
+                      ? `${est.estDate} (${est.monthsRemaining} mo)`
+                      : est.estDate
+                    : '—';
+                  return (
+                    <tr key={m.id}>
+                      <td>
+                        <input
+                          type="number"
+                          value={m.target}
+                          onChange={(e) => {
+                            const nextValue = parseFloat(e.target.value);
+                            updateMilestone(m.id, { target: isNaN(nextValue) ? 0 : nextValue });
+                          }}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="date"
+                          value={m.targetDate || ''}
+                          onChange={(e) => updateMilestone(m.id, { targetDate: e.target.value })}
+                        />
+                      </td>
+                      <td>{est.status}</td>
+                      <td>{est.dateReached || '—'}</td>
+                      <td>{estLabel}</td>
+                      <td>
+                        <button className="delete-btn" onClick={() => removeMilestone(m.id)}>Remove</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {milestones.length === 0 && (
+                  <tr>
+                    <td colSpan="6" style={{ textAlign: 'center' }}>No milestones yet.</td>
+                  </tr>
+                )}
+              </tbody>
+              </table>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', marginTop: '10px', flexWrap: 'wrap' }}>
+              <button onClick={addMilestone}>Add Milestone</button>
+              <button onClick={() => saveMilestones(milestones)} disabled={!milestonesDirty}>Save Milestones</button>
+            </div>
+          </div>
+          <div className="card">
+            <h2>Profit Tracker</h2>
+            <div className="section-controls">
+              <div>
+                <label>Display Currency</label>
+                <select value={profitCurrency} onChange={(e) => handleProfitCurrencyChange(e.target.value)}>
+                  {currencies.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="row">
+              <div className="col">
+                <label>Minimum Salary (RON)</label>
+                <input
+                  type="number"
+                  value={profitSettings.minSalary}
+                  onChange={(e) => {
+                    const nextValue = parseFloat(e.target.value);
+                    setProfitSettings((prev) => ({ ...prev, minSalary: isNaN(nextValue) ? 0 : nextValue }));
+                    setProfitDirty(true);
+                  }}
+                />
+                <label>CASS Rate</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={profitSettings.cassRate}
+                  onChange={(e) => {
+                    const nextValue = parseFloat(e.target.value);
+                    setProfitSettings((prev) => ({ ...prev, cassRate: isNaN(nextValue) ? 0 : nextValue }));
+                    setProfitDirty(true);
+                  }}
+                />
+              </div>
+              <div className="col">
+                <label>Thresholds (x Minimum Salary)</label>
+                <div style={{ marginBottom: '10px' }}>
+                  {(profitSettings.thresholds || [6, 12, 24]).map((t, idx) => (
+                    <div key={idx}>{t}x = {(profitSettings.minSalary * t).toFixed(2)} RON</div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="table-wrapper">
+              <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Profit ({profitCurrency})</th>
+                  <th>Name</th>
+                  <th>Comment</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {profitEntries.map((entry) => (
+                  <tr key={entry.id}>
+                    <td>
+                      <input
+                        type="date"
+                        value={entry.date || ''}
+                        onChange={(e) => updateProfitEntry(entry.id, { date: e.target.value })}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        type="number"
+                        value={entry.amount}
+                        onChange={(e) => {
+                          const nextValue = parseFloat(e.target.value);
+                          updateProfitEntry(entry.id, { amount: isNaN(nextValue) ? 0 : nextValue });
+                        }}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        value={entry.name || ''}
+                        onChange={(e) => updateProfitEntry(entry.id, { name: e.target.value })}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        value={entry.comment || ''}
+                        onChange={(e) => updateProfitEntry(entry.id, { comment: e.target.value })}
+                      />
+                    </td>
+                    <td>
+                      <button className="delete-btn" onClick={() => removeProfitEntry(entry.id)}>Remove</button>
+                    </td>
+                  </tr>
+                ))}
+                {profitEntries.length === 0 && (
+                  <tr>
+                    <td colSpan="5" style={{ textAlign: 'center' }}>No profit entries yet.</td>
+                  </tr>
+                )}
+              </tbody>
+              </table>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', marginTop: '10px', flexWrap: 'wrap' }}>
+              <button onClick={addProfitEntry}>Add Entry</button>
+              <button onClick={() => saveProfitTracker(profitEntries, profitSettings)} disabled={!profitDirty}>Save Profit Tracker</button>
+            </div>
+            <h3>Yearly Summary</h3>
+            <div className="table-wrapper">
+              <table>
+              <thead>
+                <tr>
+                  <th>Year</th>
+                  <th>Total Profit ({profitCurrency})</th>
+                  <th>CASS Due ({profitCurrency})</th>
+                </tr>
+              </thead>
+              <tbody>
+                {profitYears.map((year) => {
+                  const total = profitByYear[year] || 0;
+                  const profitInRon = convertAmount(total, profitCurrency, 'RON');
+                  const cassDueRon = calcCassDue(profitInRon);
+                  const cassDisplay = convertAmount(cassDueRon, 'RON', profitCurrency);
+                  return (
+                    <tr key={year}>
+                      <td>{year}</td>
+                      <td>{total.toFixed(2)}</td>
+                      <td>{cassDisplay.toFixed(2)}</td>
+                    </tr>
+                  );
+                })}
+                {profitYears.length === 0 && (
+                  <tr>
+                    <td colSpan="3" style={{ textAlign: 'center' }}>No yearly data yet.</td>
+                  </tr>
+                )}
+              </tbody>
+              </table>
+            </div>
+          </div>
+          <div className="card">
+            <h2>Safe Withdrawal</h2>
+            <div className="section-controls">
+              <div>
+                <label>Display Currency</label>
+                <select value={swrCurrency} onChange={(e) => setSwrCurrency(e.target.value)}>
+                  {currencies.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div style={{ marginBottom: '10px' }}>
+              <div><strong>Portfolio value:</strong> {swrCurrentValue.toFixed(2)} {swrCurrency}</div>
+              <div><strong>Value + Retirement:</strong> {portfolioPlusRetirement.toFixed(2)} {swrCurrency}</div>
+            </div>
+            <div className="table-wrapper">
+              <table>
+              <thead>
+                <tr>
+                  <th>Rate</th>
+                  <th>Annual ({swrCurrency})</th>
+                  <th>Monthly ({swrCurrency})</th>
+                  <th>Annual (Value + Retirement)</th>
+                  <th>Monthly (Value + Retirement)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[0.04, 0.05, 0.06].map((rate) => {
+                  const annual = swrCurrentValue * rate;
+                  const annualPlus = portfolioPlusRetirement * rate;
+                  return (
+                    <tr key={rate}>
+                      <td>{(rate * 100).toFixed(0)}%</td>
+                      <td>{annual.toFixed(2)}</td>
+                      <td>{(annual / 12).toFixed(2)}</td>
+                      <td>{annualPlus.toFixed(2)}</td>
+                      <td>{(annualPlus / 12).toFixed(2)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       );
     }

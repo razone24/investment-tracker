@@ -1,27 +1,31 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const fsp = require('fs/promises');
 const path = require('path');
 const url = require('url');
+const zlib = require('zlib');
+const crypto = require('crypto');
 
 /*
- * Investment tracker backend without external dependencies
+ * Investment tracker backend without external dependencies.
  *
- * This server provides a REST API and static file hosting without relying
- * on third‑party modules such as Express.  It uses Node's built‑in
- * `http` and `https` modules to handle routing, JSON parsing and CORS
- * headers.  The exchange rates are scraped from https://www.cursbnr.ro/
- * using a simple regular expression.  Data persistence is handled via
- * a JSON file on disk.
+ * Changes in this revision:
+ * - Queryable/paginated investments endpoint with backward-compatible array mode.
+ * - Investment edit API, bulk delete API, import validation API.
+ * - Portfolio summary API with by-fund and by-platform aggregates.
+ * - Async, debounced, atomic JSON persistence to avoid blocking sync writes.
+ * - Static asset caching headers (ETag/Cache-Control) + optional gzip.
+ * - Safer/stronger id generation than Date.now() collisions.
+ * - Rates fetch hardening with fallback provider + TTL policy.
  */
 
-// Location where data will be stored
 const dataFile = path.join(__dirname, 'data.json');
+const publicDir = path.join(__dirname, 'public');
 
-// In‑memory state
 let investments = [];
 let objective = null;
-let rates = { date: null, rates: { RON: 1 } };
+let rates = { date: null, rates: { RON: 1 }, provider: 'bootstrap' };
 let netWorth = { manualItems: [] };
 let milestones = [];
 let milestonesCurrency = 'RON';
@@ -29,6 +33,10 @@ let profitTracker = {
   entries: [],
   settings: { minSalary: 4050, cassRate: 0.1, thresholds: [6, 12, 24], currency: 'RON' },
 };
+
+let prediction = null;
+let predicting = false;
+let predictionId = null;
 
 const defaultNetWorthItems = () => ([
   { id: 'nw-realestate', name: 'RealEstate', type: 'asset', value: 0, currency: 'RON' },
@@ -43,435 +51,754 @@ const defaultNetWorthItems = () => ([
 
 const defaultProfitSettings = () => ({ minSalary: 4050, cassRate: 0.1, thresholds: [6, 12, 24], currency: 'RON' });
 
-// Store the latest prediction returned by the LLM.  This value will be
-// returned to the client via the /api/prediction endpoint.  A small
-// flag prevents concurrent calls to the LLM so that multiple rapid
-// updates (e.g. during bulk imports) don't queue unnecessary requests.
-let prediction = null;
-let predicting = false;
-let predictionId = null; // Track the current prediction request
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
 
-/**
- * Build a natural language prompt summarising the current portfolio
- * and objective.  The prompt asks the LLM to estimate how long it
- * might take to reach the target amount given the historical
- * contributions.  The format is intentionally simple to maximise
- * compatibility with different models.  If no objective is set the
- * prompt returns a minimal string.
- */
-function generatePrompt() {
-  if (!objective) {
-    return 'There is currently no investment objective set.';
+const MAX_BODY_SIZE_BYTES = 10 * 1024 * 1024;
+const PERSIST_DEBOUNCE_MS = 150;
+const RATES_TTL_MS = 6 * 60 * 60 * 1000;
+
+let persistTimer = null;
+let persistPending = false;
+let persistInFlight = false;
+let lastRatesFetchAt = 0;
+let idCounter = 0;
+let server = null;
+let ratesInterval = null;
+
+const staticCache = new Map();
+
+function sanitizeString(value, fallback = '') {
+  if (typeof value === 'string') {
+    const v = value.trim();
+    return v || fallback;
   }
-  
-  const lines = [];
-  lines.push(`Target: ${objective.targetAmount} ${objective.currency}`);
-  
-  // Group investments by year and month for more compact representation
-  const groupedInvestments = {};
-  let totalInvested = 0;
-  
-  investments.forEach((inv) => {
-    const date = new Date(inv.date);
-    const year = date.getFullYear();
-    const month = date.getMonth() + 1; // getMonth() returns 0-11
-    const key = `${year}-${month.toString().padStart(2, '0')}`;
-    
-    if (!groupedInvestments[key]) {
-      groupedInvestments[key] = {
-        total: 0,
-        count: 0,
-        funds: new Set(),
-        platforms: new Set()
-      };
-    }
-    
-    groupedInvestments[key].total += inv.amount;
-    groupedInvestments[key].count += 1;
-    groupedInvestments[key].funds.add(inv.fund);
-    groupedInvestments[key].platforms.add(inv.platform);
-    totalInvested += inv.amount;
+  return fallback;
+}
+
+function parseNumberMaybe(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'string') {
+    const n = parseFloat(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function toPositiveInt(value, fallback, max = 1000) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(max, n);
+}
+
+function normalizeDateInput(dateStr) {
+  if (typeof dateStr !== 'string') return null;
+  const trimmed = dateStr.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function sortInvestmentsByTimestampDesc(list) {
+  list.sort((a, b) => {
+    const at = typeof a.timestamp === 'number' ? a.timestamp : 0;
+    const bt = typeof b.timestamp === 'number' ? b.timestamp : 0;
+    return bt - at;
   });
-  
-  // Sort by date (newest first)
-  const sortedKeys = Object.keys(groupedInvestments).sort().reverse();
-  
-  // Handle case with no investments
-  if (sortedKeys.length === 0) {
-    lines.push('No investments recorded yet.');
-    lines.push('Based on the target amount, estimate how much time it will take to reach the goal.');
-    lines.push('Please provide a short answer in this exact format: "It will take you X years" or "It will take you X months" where X is a number.');
-    lines.push('Be realistic and consider that no investments have been made yet.');
-    return lines.join('\n');
+}
+
+function generateId(prefix = 'inv') {
+  idCounter = (idCounter + 1) % 1000000;
+  const nowPart = Date.now().toString(36);
+  const hrPart = process.hrtime.bigint().toString(36).slice(-7);
+  const randPart = crypto.randomBytes(2).toString('hex');
+  const countPart = idCounter.toString(36);
+  return `${prefix}-${nowPart}-${hrPart}-${randPart}-${countPart}`;
+}
+
+function normalizeInvestmentPayload(input, existing = null) {
+  if (!input || typeof input !== 'object') {
+    return { ok: false, error: 'Invalid payload' };
   }
-  
-  lines.push(`Total invested: ${totalInvested.toFixed(2)} ${objective.currency}`);
-  lines.push(`Investment period: ${sortedKeys[sortedKeys.length - 1]} to ${sortedKeys[0]}`);
-  lines.push(`Number of investments: ${investments.length}`);
-  
-  // If we have too many months, group by quarters or years
-  if (sortedKeys.length > 12) {
-    // Group by quarters for better readability
-    const quarterlyData = {};
-    sortedKeys.forEach(key => {
-      const [year, month] = key.split('-');
-      const quarter = Math.ceil(parseInt(month) / 3);
-      const quarterKey = `${year}-Q${quarter}`;
-      
-      if (!quarterlyData[quarterKey]) {
-        quarterlyData[quarterKey] = {
-          total: 0,
-          count: 0,
+
+  const merged = {
+    ...existing,
+    ...input,
+  };
+
+  const currency = sanitizeString(merged.currency, '').toUpperCase();
+  const fund = sanitizeString(merged.fund, 'Unknown');
+  const platform = sanitizeString(merged.platform, 'Unknown');
+  const date = normalizeDateInput(merged.date);
+
+  const unitPrice = parseNumberMaybe(merged.unitPrice);
+  const units = parseNumberMaybe(merged.units);
+  const amountFromPayload = parseNumberMaybe(merged.amount);
+
+  let amount = null;
+  if (unitPrice != null && units != null && unitPrice >= 0) {
+    amount = unitPrice * units;
+  } else if (amountFromPayload != null) {
+    amount = amountFromPayload;
+  } else if (existing && typeof existing.amount === 'number') {
+    amount = existing.amount;
+  }
+
+  if (!currency || !fund || !platform || !date) {
+    return { ok: false, error: 'currency, fund, platform and date are required' };
+  }
+  if (amount == null || !Number.isFinite(amount)) {
+    return { ok: false, error: 'amount or unitPrice+units are required' };
+  }
+
+  const normalized = {
+    currency,
+    fund,
+    platform,
+    date,
+    amount,
+  };
+
+  if (unitPrice != null && Number.isFinite(unitPrice)) {
+    normalized.unitPrice = unitPrice;
+  }
+  if (units != null && Number.isFinite(units)) {
+    normalized.units = units;
+    if (units < 0) normalized.isSale = true;
+  }
+
+  return { ok: true, investment: normalized };
+}
+
+function validateImportRows(rawRows) {
+  const rows = Array.isArray(rawRows) ? rawRows : [];
+  const validRows = [];
+  const invalidRows = [];
+  const errors = [];
+
+  rows.forEach((row, idx) => {
+    const parsed = normalizeInvestmentPayload(row, null);
+    if (parsed.ok) {
+      validRows.push(parsed.investment);
+    } else {
+      const failure = {
+        index: idx,
+        error: parsed.error || 'Invalid row',
+        row,
+      };
+      invalidRows.push(failure);
+      errors.push({ index: idx, message: failure.error });
+    }
+  });
+
+  return { validRows, invalidRows, errors };
+}
+
+function convertAmount(amount, from, to) {
+  if (!rates.rates[from] || !rates.rates[to]) return null;
+  const inRon = amount * rates.rates[from];
+  return inRon / rates.rates[to];
+}
+
+function pickLatestInvestment(list) {
+  let latest = null;
+  for (const inv of list) {
+    if (!latest) {
+      latest = inv;
+      continue;
+    }
+    if (inv.date > latest.date) {
+      latest = inv;
+      continue;
+    }
+    if (inv.date === latest.date) {
+      const curTs = typeof inv.timestamp === 'number' ? inv.timestamp : 0;
+      const bestTs = typeof latest.timestamp === 'number' ? latest.timestamp : 0;
+      if (curTs > bestTs) {
+        latest = inv;
+      }
+    }
+  }
+  return latest;
+}
+
+function getFundGroups(sourceInvestments) {
+  const byFund = {};
+  for (const inv of sourceInvestments) {
+    if (!byFund[inv.fund]) byFund[inv.fund] = [];
+    byFund[inv.fund].push(inv);
+  }
+  return byFund;
+}
+
+function computeLatestPriceForFund(invs) {
+  const latestInv = pickLatestInvestment(invs);
+  if (!latestInv) return null;
+  if (typeof latestInv.unitPrice === 'number') {
+    return { price: latestInv.unitPrice, currency: latestInv.currency };
+  }
+  if (typeof latestInv.units === 'number' && latestInv.units !== 0) {
+    return { price: latestInv.amount / latestInv.units, currency: latestInv.currency };
+  }
+  return null;
+}
+
+function computePortfolioSummary(targetCurrency) {
+  const desiredCurrency = sanitizeString(targetCurrency, 'RON').toUpperCase();
+  const byFund = getFundGroups(investments);
+
+  const fundRows = [];
+  const platformMap = {};
+
+  let totalInvested = 0;
+  let totalCurrentValue = 0;
+  let totalRealized = 0;
+
+  const latestByFund = {};
+  Object.keys(byFund).forEach((fund) => {
+    latestByFund[fund] = computeLatestPriceForFund(byFund[fund]);
+  });
+
+  Object.keys(byFund).forEach((fund) => {
+    const invs = byFund[fund];
+    const latest = latestByFund[fund];
+
+    let totalUnits = 0;
+    let investedAmount = 0;
+    let buyUnits = 0;
+    let buyAmount = 0;
+    let soldUnits = 0;
+    let saleProceeds = 0;
+
+    invs.forEach((inv) => {
+      const invUnits = typeof inv.units === 'number'
+        ? inv.units
+        : (typeof inv.unitPrice === 'number' && inv.unitPrice !== 0 ? inv.amount / inv.unitPrice : 0);
+
+      let normalizedUnits = invUnits;
+      if ((!Number.isFinite(normalizedUnits) || normalizedUnits === 0) && latest) {
+        const conv = convertAmount(inv.amount, inv.currency, latest.currency);
+        if (conv != null && latest.price !== 0) {
+          normalizedUnits = conv / latest.price;
+        }
+      }
+      if (!Number.isFinite(normalizedUnits)) normalizedUnits = 0;
+
+      totalUnits += normalizedUnits;
+
+      const isSale = normalizedUnits < 0 || inv.amount < 0;
+      if (isSale) {
+        soldUnits += Math.abs(normalizedUnits);
+        const proceeds = convertAmount(Math.abs(inv.amount), inv.currency, desiredCurrency);
+        if (proceeds != null) saleProceeds += proceeds;
+      } else {
+        const invested = convertAmount(inv.amount, inv.currency, desiredCurrency);
+        if (invested != null) {
+          investedAmount += invested;
+          buyAmount += invested;
+        }
+        buyUnits += Math.max(0, normalizedUnits);
+      }
+
+      if (!platformMap[inv.platform]) {
+        platformMap[inv.platform] = {
+          platform: inv.platform,
+          transactions: 0,
+          invested: 0,
+          currentValue: 0,
+          units: 0,
+          realizedDelta: 0,
+          unrealizedDelta: 0,
+          pnlTotal: 0,
           funds: new Set(),
-          platforms: new Set()
         };
       }
-      
-      const data = groupedInvestments[key];
-      quarterlyData[quarterKey].total += data.total;
-      quarterlyData[quarterKey].count += data.count;
-      data.funds.forEach(fund => quarterlyData[quarterKey].funds.add(fund));
-      data.platforms.forEach(platform => quarterlyData[quarterKey].platforms.add(platform));
+
+      const platformRow = platformMap[inv.platform];
+      platformRow.transactions += 1;
+      platformRow.units += normalizedUnits;
+      platformRow.funds.add(inv.fund);
+      if (isSale) {
+        const proceeds = convertAmount(Math.abs(inv.amount), inv.currency, desiredCurrency);
+        if (proceeds != null) {
+          platformRow.realizedDelta += proceeds;
+          platformRow.pnlTotal += proceeds;
+        }
+      } else {
+        const invested = convertAmount(inv.amount, inv.currency, desiredCurrency);
+        if (invested != null) {
+          platformRow.invested += invested;
+        }
+      }
     });
-    
-    lines.push('Quarterly investment summary:');
-    Object.keys(quarterlyData).sort().reverse().forEach(quarter => {
-      const data = quarterlyData[quarter];
-      lines.push(` - ${quarter}: ${data.total.toFixed(2)} ${objective.currency} (${data.count} investments, ${data.funds.size} funds)`);
-    });
-  } else {
-    // Show monthly breakdown if not too many months
-    lines.push('Monthly investment summary:');
-    sortedKeys.forEach(key => {
-      const data = groupedInvestments[key];
-      lines.push(` - ${key}: ${data.total.toFixed(2)} ${objective.currency} (${data.count} investments)`);
-    });
-  }
-  
-  // Add fund diversity information
-  const allFunds = new Set();
-  const allPlatforms = new Set();
-  investments.forEach(inv => {
-    allFunds.add(inv.fund);
-    allPlatforms.add(inv.platform);
-  });
-  
-  lines.push(`Portfolio diversity: ${allFunds.size} different funds across ${allPlatforms.size} platforms`);
-  
-  // Calculate average monthly investment, excluding significant one-time investments
-  const monthsDiff = sortedKeys.length;
-  
-  // Identify potential one-time investments (outliers)
-  const monthlyTotals = sortedKeys.map(key => groupedInvestments[key].total);
-  const sortedMonthlyTotals = [...monthlyTotals].sort((a, b) => a - b);
-  
-  // Calculate median and use it to identify outliers
-  const median = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length / 2)];
-  const q1 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.25)];
-  const q3 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.75)];
-  const iqr = q3 - q1;
-  
-  // Use a more conservative outlier threshold (0.5 * IQR instead of 1.0 * IQR)
-  // and also consider the median as a baseline for "normal" recurring investments
-  const outlierThreshold = Math.min(q3 + (0.5 * iqr), median * 1.8);
-  
-  // Additional check: if the median itself is high, use a percentage of it
-  const medianBasedThreshold = median * 1.2;
-  const finalThreshold = Math.min(outlierThreshold, medianBasedThreshold);
-  
-  // Filter out months with outlier investments for recurring calculation
-  const recurringMonths = sortedKeys.filter(key => {
-    const monthlyTotal = groupedInvestments[key].total;
-    return monthlyTotal <= finalThreshold;
-  });
-  
-  const recurringTotal = recurringMonths.reduce((sum, key) => sum + groupedInvestments[key].total, 0);
-  const avgMonthlyRecurring = recurringTotal / recurringMonths.length;
-  const avgMonthlyAll = totalInvested / monthsDiff;
-  
-  // Count outlier months
-  const outlierMonths = sortedKeys.filter(key => groupedInvestments[key].total > finalThreshold);
-  
-  if (outlierMonths.length > 0) {
-    lines.push(`Recurring monthly investment (excluding outliers): ${avgMonthlyRecurring.toFixed(2)} ${objective.currency}`);
-    lines.push(`Overall average (including all): ${avgMonthlyAll.toFixed(2)} ${objective.currency}`);
-    lines.push(`One-time investment months: ${outlierMonths.length} (${outlierMonths.map(m => groupedInvestments[m].total.toFixed(0)).join(', ')} ${objective.currency})`);
-  } else {
-    lines.push(`Average monthly investment: ${avgMonthlyAll.toFixed(2)} ${objective.currency}`);
-  }
-  
-  lines.push('Based on the above investment history and the target, estimate how much time it will take to reach the goal.');
-  lines.push('Please provide a short answer in this exact format: "It will take you X years" or "It will take you X months" where X is a number.');
-  if (outlierMonths.length > 0) {
-    lines.push('Focus on the recurring monthly investment rate, not the overall average which includes one-time large investments.');
-  }
-  lines.push('Consider one-time investments vs recurring patterns. Be realistic and concise.');
-  
-  const prompt = lines.join('\n');
-  
-  // If prompt is still too long, create an even more compact version
-  if (prompt.length > 4000) {
-    const compactLines = [];
-    compactLines.push(`Target: ${objective.targetAmount} ${objective.currency}`);
-    compactLines.push(`Total invested: ${totalInvested.toFixed(2)} ${objective.currency}`);
-    compactLines.push(`Investment period: ${sortedKeys[sortedKeys.length - 1]} to ${sortedKeys[0]} (${sortedKeys.length} months)`);
-    compactLines.push(`Number of investments: ${investments.length}`);
-    compactLines.push(`Portfolio diversity: ${allFunds.size} funds across ${allPlatforms.size} platforms`);
-    
-    // Use the same outlier detection logic for compact version
-    const monthlyTotals = sortedKeys.map(key => groupedInvestments[key].total);
-    const sortedMonthlyTotals = [...monthlyTotals].sort((a, b) => a - b);
-    const median = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length / 2)];
-    const q1 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.25)];
-    const q3 = sortedMonthlyTotals[Math.floor(sortedMonthlyTotals.length * 0.75)];
-    const iqr = q3 - q1;
-    
-    // Use more conservative outlier detection
-    const outlierThreshold = Math.min(q3 + (0.5 * iqr), median * 1.8);
-    const medianBasedThreshold = median * 1.2;
-    const finalThreshold = Math.min(outlierThreshold, medianBasedThreshold);
-    
-    const recurringMonths = sortedKeys.filter(key => groupedInvestments[key].total <= finalThreshold);
-    const recurringTotal = recurringMonths.reduce((sum, key) => sum + groupedInvestments[key].total, 0);
-    const avgMonthlyRecurring = recurringTotal / recurringMonths.length;
-    const avgMonthlyAll = totalInvested / sortedKeys.length;
-    
-    const outlierMonths = sortedKeys.filter(key => groupedInvestments[key].total > finalThreshold);
-    
-    if (outlierMonths.length > 0) {
-      compactLines.push(`Recurring monthly: ${avgMonthlyRecurring.toFixed(2)} ${objective.currency} (excluding ${outlierMonths.length} outlier months)`);
+
+    let currentValue = 0;
+    if (latest) {
+      const valueInLatest = totalUnits * latest.price;
+      const converted = convertAmount(valueInLatest, latest.currency, desiredCurrency);
+      currentValue = converted != null ? converted : 0;
     } else {
-      compactLines.push(`Average monthly investment: ${avgMonthlyAll.toFixed(2)} ${objective.currency}`);
-    }
-    
-    // Show only the most recent 6 months if there are many months
-    if (sortedKeys.length > 6) {
-      compactLines.push('Recent 6 months:');
-      sortedKeys.slice(0, 6).forEach(key => {
-        const data = groupedInvestments[key];
-        compactLines.push(` - ${key}: ${data.total.toFixed(2)} ${objective.currency}`);
-      });
-    } else {
-      compactLines.push('Monthly breakdown:');
-      sortedKeys.forEach(key => {
-        const data = groupedInvestments[key];
-        compactLines.push(` - ${key}: ${data.total.toFixed(2)} ${objective.currency}`);
+      invs.forEach((inv) => {
+        const converted = convertAmount(inv.amount, inv.currency, desiredCurrency);
+        if (converted != null) currentValue += converted;
       });
     }
-    
-    compactLines.push('Based on the above investment history and the target, estimate how much time it will take to reach the goal.');
-    compactLines.push('Please provide a short answer in this exact format: "It will take you X years" or "It will take you X months" where X is a number.');
-    if (outlierMonths.length > 0) {
-      compactLines.push('Focus on the recurring monthly investment rate, not the overall average which includes one-time large investments.');
-    }
-    compactLines.push('Consider one-time investments vs recurring patterns. Be realistic and concise.');
-    
-    return compactLines.join('\n');
-  }
-  
-  return prompt;
+
+    const avgBuyCost = buyUnits > 0 ? buyAmount / buyUnits : 0;
+    const soldCostEstimate = soldUnits * avgBuyCost;
+    const realizedDelta = saleProceeds - soldCostEstimate;
+    const currentCostBasis = Math.max(0, totalUnits) * avgBuyCost;
+    const unrealizedDelta = currentValue - currentCostBasis;
+    const pnlTotal = realizedDelta + unrealizedDelta;
+
+    fundRows.push({
+      fund,
+      transactions: invs.length,
+      units: totalUnits,
+      invested: investedAmount,
+      currentValue,
+      latestUnitPrice: latest ? convertAmount(latest.price, latest.currency, desiredCurrency) : null,
+      latestPriceCurrency: desiredCurrency,
+      avgBuyCost,
+      realizedDelta,
+      unrealizedDelta,
+      pnlTotal,
+    });
+
+    totalInvested += investedAmount;
+    totalCurrentValue += currentValue;
+    totalRealized += realizedDelta;
+  });
+
+  const platformRows = Object.values(platformMap).map((row) => {
+    const fundList = Array.from(row.funds);
+    let currentValue = 0;
+
+    fundList.forEach((fund) => {
+      const latest = latestByFund[fund];
+      if (!latest) return;
+      const invs = investments.filter((inv) => inv.platform === row.platform && inv.fund === fund);
+      let units = 0;
+      invs.forEach((inv) => {
+        if (typeof inv.units === 'number') {
+          units += inv.units;
+        } else if (typeof inv.unitPrice === 'number' && inv.unitPrice !== 0) {
+          units += inv.amount / inv.unitPrice;
+        } else {
+          const conv = convertAmount(inv.amount, inv.currency, latest.currency);
+          if (conv != null && latest.price !== 0) units += conv / latest.price;
+        }
+      });
+      const valueInLatest = units * latest.price;
+      const converted = convertAmount(valueInLatest, latest.currency, desiredCurrency);
+      if (converted != null) currentValue += converted;
+    });
+
+    const unrealized = currentValue - row.invested;
+    return {
+      platform: row.platform,
+      transactions: row.transactions,
+      funds: fundList.length,
+      units: row.units,
+      invested: row.invested,
+      currentValue,
+      realizedDelta: row.realizedDelta,
+      unrealizedDelta: unrealized,
+      pnlTotal: row.realizedDelta + unrealized,
+    };
+  });
+
+  fundRows.sort((a, b) => b.currentValue - a.currentValue);
+  platformRows.sort((a, b) => b.currentValue - a.currentValue);
+
+  return {
+    currency: desiredCurrency,
+    totals: {
+      invested: totalInvested,
+      currentValue: totalCurrentValue,
+      realizedDelta: totalRealized,
+      unrealizedDelta: totalCurrentValue - totalInvested,
+      pnlTotal: (totalCurrentValue - totalInvested) + totalRealized,
+    },
+    byFund: fundRows,
+    byPlatform: platformRows,
+    ratesDate: rates.date,
+  };
 }
 
-/**
- * Invoke an Ollama model to generate a prediction.  The model is
- * accessed via the local Ollama API running on port 11434.  The
- * request payload contains the model name, a prompt and disables
- * streaming for simplicity.  Responses are parsed to extract the
- * assistant message.  In case of failure the raw response (or
- * error) is saved to the prediction variable.  Concurrent calls are
- * prevented via the `predicting` flag.
- */
-function callPrediction() {
-  if (!objective || investments.length === 0) {
-    prediction = null;
-    return;
+function buildQueryResult(source, query) {
+  const hasQueryParams = query && Object.keys(query).length > 0;
+  const legacy =
+    !hasQueryParams ||
+    query.legacy === '1' ||
+    query.legacy === 'true' ||
+    query.shape === 'array';
+
+  const normalized = [...source];
+  sortInvestmentsByTimestampDesc(normalized);
+
+  if (legacy) {
+    return { legacy: true, data: normalized };
   }
-  if (predicting) return;
-  predicting = true;
-  const currentPredictionId = Date.now().toString();
-  predictionId = currentPredictionId;
-  const prompt = generatePrompt();
-  const postData = JSON.stringify({ model: 'llama2', prompt: prompt, stream: false });
-  // Allow overriding the Ollama host and port via environment variables.  This
-  // makes it easier to connect to an Ollama server running outside of a
-  // container (e.g. using host.docker.internal) when the backend runs in
-  // Docker.  Defaults remain localhost:11434 for typical usage.
-  const ollamaHost = process.env.OLLAMA_HOST || 'localhost';
-  const ollamaPortRaw = process.env.OLLAMA_PORT;
-  const ollamaPort = ollamaPortRaw ? parseInt(ollamaPortRaw, 10) : 11434;
-  const options = {
-    hostname: ollamaHost,
-    port: ollamaPort,
-    path: '/api/generate',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(postData),
+
+  const search = sanitizeString(query.search, '').toLowerCase();
+  const fund = sanitizeString(query.fund, '');
+  const platform = sanitizeString(query.platform, '');
+  const dateFrom = normalizeDateInput(query.dateFrom);
+  const dateTo = normalizeDateInput(query.dateTo);
+
+  let filtered = normalized;
+
+  if (fund && fund !== 'All') {
+    filtered = filtered.filter((inv) => inv.fund === fund);
+  }
+  if (platform && platform !== 'All') {
+    filtered = filtered.filter((inv) => inv.platform === platform);
+  }
+  if (dateFrom) {
+    filtered = filtered.filter((inv) => inv.date >= dateFrom);
+  }
+  if (dateTo) {
+    filtered = filtered.filter((inv) => inv.date <= dateTo);
+  }
+  if (search) {
+    filtered = filtered.filter((inv) => {
+      const haystack = `${inv.fund} ${inv.platform} ${inv.currency} ${inv.date}`.toLowerCase();
+      return haystack.includes(search);
+    });
+  }
+
+  const sortBy = sanitizeString(query.sortBy, 'timestamp');
+  const sortDir = sanitizeString(query.sortDir, 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
+
+  const sortableField = ['timestamp', 'date', 'fund', 'platform', 'amount', 'currency', 'units', 'unitPrice'].includes(sortBy)
+    ? sortBy
+    : 'timestamp';
+
+  filtered.sort((a, b) => {
+    const av = a[sortableField];
+    const bv = b[sortableField];
+
+    let cmp = 0;
+    if (typeof av === 'number' && typeof bv === 'number') {
+      cmp = av - bv;
+    } else {
+      const as = av == null ? '' : String(av);
+      const bs = bv == null ? '' : String(bv);
+      cmp = as.localeCompare(bs);
+    }
+
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+
+  const page = toPositiveInt(query.page, 1, 1_000_000);
+  const pageSize = toPositiveInt(query.pageSize, 25, 500);
+  const total = filtered.length;
+  const start = (page - 1) * pageSize;
+  const items = filtered.slice(start, start + pageSize);
+
+  return {
+    legacy: false,
+    data: {
+      items,
+      total,
+      page,
+      pageSize,
+      sortBy: sortableField,
+      sortDir,
+      filters: {
+        search,
+        fund: fund || 'All',
+        platform: platform || 'All',
+        dateFrom: dateFrom || '',
+        dateTo: dateTo || '',
+      },
     },
   };
-  const req = http.request(options, (res) => {
-    let data = '';
-    res.on('data', (chunk) => {
-      data += chunk;
-    });
-    res.on('end', () => {
-      predicting = false;
-      try {
-        const parsed = JSON.parse(data);
-        let content = null;
-        if (parsed) {
-          // Ollama may return { response: 'text' } or { message: { content: 'text' } }
-          if (parsed.message && parsed.message.content) {
-            content = parsed.message.content;
-          } else if (parsed.response) {
-            content = parsed.response;
-          }
-        }
-        prediction = content || data;
-        console.log('Prediction updated:', prediction);
-      } catch (err) {
-        prediction = data;
-        console.error('Error parsing prediction response:', err);
-      }
-    });
-  });
-  req.on('error', (err) => {
-    predicting = false;
-    prediction = null;
-    predictionId = null;
-    console.error('Prediction request error:', err);
-  });
-  req.write(postData);
-  req.end();
 }
 
-/**
- * Load investments and objective from disk into memory.  If the file
- * does not exist the default empty values remain.
- */
+function sendJson(res, statusCode, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(statusCode, {
+    ...CORS_HEADERS,
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function sendNoContent(res, statusCode = 204) {
+  res.writeHead(statusCode, {
+    ...CORS_HEADERS,
+  });
+  res.end();
+}
+
+function parseRequestBody(req, res, cb) {
+  let body = '';
+  let tooLarge = false;
+
+  req.on('data', (chunk) => {
+    if (tooLarge) return;
+    body += chunk;
+    if (Buffer.byteLength(body) > MAX_BODY_SIZE_BYTES) {
+      tooLarge = true;
+      sendJson(res, 413, { error: 'Payload too large' });
+      req.destroy();
+    }
+  });
+
+  req.on('end', () => {
+    if (tooLarge) return;
+    if (!body) {
+      cb(null, null);
+      return;
+    }
+    try {
+      const payload = JSON.parse(body);
+      cb(null, payload);
+    } catch (err) {
+      cb(new Error('Invalid JSON'));
+    }
+  });
+
+  req.on('error', (err) => cb(err));
+}
+
+function getContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.html': return 'text/html; charset=utf-8';
+    case '.css': return 'text/css; charset=utf-8';
+    case '.js': return 'application/javascript; charset=utf-8';
+    case '.mjs': return 'application/javascript; charset=utf-8';
+    case '.json': return 'application/json; charset=utf-8';
+    case '.svg': return 'image/svg+xml';
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.gif': return 'image/gif';
+    case '.ico': return 'image/x-icon';
+    case '.webp': return 'image/webp';
+    case '.woff': return 'font/woff';
+    case '.woff2': return 'font/woff2';
+    default: return 'application/octet-stream';
+  }
+}
+
+function isCompressibleContent(contentType) {
+  return (
+    contentType.startsWith('text/') ||
+    contentType.includes('javascript') ||
+    contentType.includes('json') ||
+    contentType.includes('svg+xml')
+  );
+}
+
+async function readStaticAsset(fullPath) {
+  const stat = await fsp.stat(fullPath);
+  const cached = staticCache.get(fullPath);
+
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached;
+  }
+
+  const data = await fsp.readFile(fullPath);
+  const contentType = getContentType(fullPath);
+  const etag = `W/\"${stat.size}-${Math.floor(stat.mtimeMs)}\"`;
+
+  const asset = {
+    data,
+    gzipData: isCompressibleContent(contentType) ? zlib.gzipSync(data, { level: 6 }) : null,
+    contentType,
+    etag,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+  };
+
+  staticCache.set(fullPath, asset);
+  return asset;
+}
+
+async function serveStatic(reqPath, req, res) {
+  let normalizedPath = reqPath || '/';
+  if (normalizedPath === '/') {
+    normalizedPath = '/index.html';
+  }
+
+  // Block traversal attempts.
+  const decodedPath = decodeURIComponent(normalizedPath);
+  const withoutLeadingSlashes = decodedPath.replace(/^[/\\]+/, '');
+  const safePath = path.normalize(withoutLeadingSlashes).replace(/^([.][.][/\\])+/, '');
+  const fullPath = path.join(publicDir, safePath);
+
+  let pathToUse = fullPath;
+  if (!fullPath.startsWith(publicDir)) {
+    pathToUse = path.join(publicDir, 'index.html');
+  }
+
+  try {
+    const asset = await readStaticAsset(pathToUse);
+    const isHtml = path.extname(pathToUse).toLowerCase() === '.html';
+    const reqEtag = req.headers['if-none-match'];
+    if (reqEtag && reqEtag === asset.etag) {
+      res.writeHead(304, {
+        ETag: asset.etag,
+      });
+      res.end();
+      return;
+    }
+
+    const acceptsGzip = typeof req.headers['accept-encoding'] === 'string' && req.headers['accept-encoding'].includes('gzip');
+    const useGzip = acceptsGzip && !!asset.gzipData;
+
+    const headers = {
+      'Content-Type': asset.contentType,
+      'ETag': asset.etag,
+      'Cache-Control': isHtml ? 'no-cache' : 'public, max-age=31536000, immutable',
+      'Vary': 'Accept-Encoding',
+    };
+
+    if (useGzip) {
+      headers['Content-Encoding'] = 'gzip';
+      headers['Content-Length'] = asset.gzipData.length;
+      res.writeHead(200, headers);
+      res.end(asset.gzipData);
+      return;
+    }
+
+    headers['Content-Length'] = asset.data.length;
+    res.writeHead(200, headers);
+    res.end(asset.data);
+  } catch (err) {
+    try {
+      const fallback = await readStaticAsset(path.join(publicDir, 'index.html'));
+      res.writeHead(200, {
+        'Content-Type': fallback.contentType,
+        'Cache-Control': 'no-cache',
+      });
+      res.end(fallback.data);
+    } catch (innerErr) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
+    }
+  }
+}
+
+function serializeState() {
+  return JSON.stringify({ investments, objective, netWorth, milestones, milestonesCurrency, profitTracker }, null, 2);
+}
+
+async function writeStateAtomic() {
+  const payload = serializeState();
+  const tmpPath = `${dataFile}.tmp`;
+  await fsp.writeFile(tmpPath, payload, 'utf8');
+  await fsp.rename(tmpPath, dataFile);
+}
+
+async function flushDataPersistence() {
+  if (persistInFlight) {
+    return;
+  }
+  if (!persistPending) {
+    return;
+  }
+
+  persistPending = false;
+  persistInFlight = true;
+  try {
+    await writeStateAtomic();
+  } catch (err) {
+    console.error('Error writing data file:', err);
+  } finally {
+    persistInFlight = false;
+    if (persistPending) {
+      await flushDataPersistence();
+    }
+  }
+}
+
+function saveData() {
+  persistPending = true;
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    flushDataPersistence().catch((err) => {
+      console.error('Persistence flush error:', err);
+    });
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+async function forceFlushData() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  persistPending = true;
+  await flushDataPersistence();
+}
+
 function loadData() {
   try {
-    if (fs.existsSync(dataFile)) {
-      const raw = fs.readFileSync(dataFile, 'utf8');
-      const parsed = JSON.parse(raw);
-      investments = Array.isArray(parsed.investments) ? parsed.investments : [];
-      // Ensure each investment has a numeric timestamp.  Pre‑existing
-      // data may only include an `id` field which was derived from
-      // `Date.now().toString()`.  If `timestamp` is missing and `id`
-      // parses to a number, use that as the timestamp.  This helps
-      // maintain ordering when computing latest price per asset.
-      investments.forEach((inv) => {
-        if (inv.timestamp == null) {
-          const ts = parseInt(inv.id, 10);
-          if (!isNaN(ts)) {
-            inv.timestamp = ts;
-          }
-        }
-      });
-      // Sort investments by timestamp in descending order (newest first) when loading
-      investments.sort((a, b) => b.timestamp - a.timestamp);
-      objective = parsed.objective || null;
-      netWorth = parsed.netWorth || { manualItems: [] };
-      milestonesCurrency = typeof parsed.milestonesCurrency === 'string' && parsed.milestonesCurrency ? parsed.milestonesCurrency : 'RON';
-      if (!Array.isArray(netWorth.manualItems) || netWorth.manualItems.length === 0) {
-        netWorth.manualItems = defaultNetWorthItems();
+    if (!fs.existsSync(dataFile)) {
+      return;
+    }
+    const raw = fs.readFileSync(dataFile, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    investments = Array.isArray(parsed.investments) ? parsed.investments : [];
+    investments.forEach((inv, idx) => {
+      if (typeof inv.timestamp !== 'number') {
+        const parsedTs = parseInt(inv.id, 10);
+        inv.timestamp = Number.isFinite(parsedTs) ? parsedTs : Date.now() - idx;
       }
-      milestones = Array.isArray(parsed.milestones) ? parsed.milestones : [];
-      profitTracker = parsed.profitTracker || { entries: [], settings: defaultProfitSettings() };
-      if (!Array.isArray(profitTracker.entries)) {
-        profitTracker.entries = [];
+      if (typeof inv.id !== 'string' || !inv.id) {
+        inv.id = generateId();
       }
-      if (!profitTracker.settings || typeof profitTracker.settings !== 'object') {
-        profitTracker.settings = defaultProfitSettings();
-      } else {
-        const defaults = defaultProfitSettings();
-        if (typeof profitTracker.settings.minSalary !== 'number') {
-          profitTracker.settings.minSalary = defaults.minSalary;
-        }
-        if (typeof profitTracker.settings.cassRate !== 'number') {
-          profitTracker.settings.cassRate = defaults.cassRate;
-        }
-        if (typeof profitTracker.settings.currency !== 'string' || !profitTracker.settings.currency) {
-          profitTracker.settings.currency = defaults.currency;
-        }
-        if (!Array.isArray(profitTracker.settings.thresholds) || profitTracker.settings.thresholds.length === 0) {
-          profitTracker.settings.thresholds = defaults.thresholds;
-        }
-      }
+    });
+    sortInvestmentsByTimestampDesc(investments);
+
+    objective = parsed.objective || null;
+    netWorth = parsed.netWorth || { manualItems: [] };
+    if (!Array.isArray(netWorth.manualItems) || netWorth.manualItems.length === 0) {
+      netWorth.manualItems = defaultNetWorthItems();
+    }
+
+    milestones = Array.isArray(parsed.milestones) ? parsed.milestones : [];
+    milestonesCurrency = typeof parsed.milestonesCurrency === 'string' && parsed.milestonesCurrency
+      ? parsed.milestonesCurrency.toUpperCase()
+      : 'RON';
+
+    profitTracker = parsed.profitTracker || { entries: [], settings: defaultProfitSettings() };
+    if (!Array.isArray(profitTracker.entries)) {
+      profitTracker.entries = [];
+    }
+    if (!profitTracker.settings || typeof profitTracker.settings !== 'object') {
+      profitTracker.settings = defaultProfitSettings();
+    }
+
+    const defaults = defaultProfitSettings();
+    if (typeof profitTracker.settings.minSalary !== 'number') profitTracker.settings.minSalary = defaults.minSalary;
+    if (typeof profitTracker.settings.cassRate !== 'number') profitTracker.settings.cassRate = defaults.cassRate;
+    if (!Array.isArray(profitTracker.settings.thresholds) || profitTracker.settings.thresholds.length === 0) {
+      profitTracker.settings.thresholds = defaults.thresholds;
+    }
+    if (typeof profitTracker.settings.currency !== 'string' || !profitTracker.settings.currency) {
+      profitTracker.settings.currency = defaults.currency;
     }
   } catch (err) {
     console.error('Error reading data file:', err);
   }
-  if (!Array.isArray(netWorth.manualItems) || netWorth.manualItems.length === 0) {
-    netWorth.manualItems = defaultNetWorthItems();
-  }
-  if (!profitTracker || typeof profitTracker !== 'object') {
-    profitTracker = { entries: [], settings: defaultProfitSettings() };
-  }
-  if (!Array.isArray(profitTracker.entries)) {
-    profitTracker.entries = [];
-  }
-  if (!profitTracker.settings || typeof profitTracker.settings !== 'object') {
-    profitTracker.settings = defaultProfitSettings();
-  } else if (typeof profitTracker.settings.currency !== 'string' || !profitTracker.settings.currency) {
-    profitTracker.settings.currency = defaultProfitSettings().currency;
-  }
 }
 
-/**
- * Save investments and objective to disk.  Synchronous write is used
- * because the dataset is expected to be small and concurrency is
- * limited in this environment.
- */
-function saveData() {
-  try {
-    const payload = JSON.stringify({ investments, objective, netWorth, milestones, milestonesCurrency, profitTracker }, null, 2);
-    fs.writeFileSync(dataFile, payload);
-  } catch (err) {
-    console.error('Error writing data file:', err);
-  }
-}
-
-/**
- * Fetch the HTML from cursbnr.ro and parse currency rates.  The site
- * publishes a table with the latest RON conversions.  A regular
- * expression extracts each currency code and its corresponding value.
- */
-function fetchRates() {
-  console.log('Fetching latest exchange rates…');
-  https
-    .get('https://www.cursbnr.ro/', (res) => {
-      let html = '';
-      res.on('data', (chunk) => (html += chunk));
-      res.on('end', () => {
-        try {
-          const newRates = parseRates(html);
-          if (newRates && Object.keys(newRates.rates).length > 1) {
-            rates = newRates;
-            console.log('Rates updated:', rates.date);
-          } else {
-            console.warn('No rates parsed from response');
-          }
-        } catch (err) {
-          console.error('Error parsing rates:', err);
-        }
-      });
-    })
-    .on('error', (err) => {
-      console.error('Error fetching rates:', err);
-    });
-}
-
-/**
- * Parse currency rates from the HTML of cursbnr.ro.  Returns an object
- * containing the date and a map of currency codes to values in RON.
- *
- * @param {string} html The raw HTML string
- * @returns {{date: string, rates: Object<string, number>}}
- */
-function parseRates(html) {
-  const result = { date: new Date().toISOString().split('T')[0], rates: { RON: 1 } };
-  // Attempt to extract the reporting date from the table header
+function parseRatesFromCursBnr(html) {
+  const result = { date: new Date().toISOString().split('T')[0], rates: { RON: 1 }, provider: 'cursbnr' };
   const dateMatch = /<th colspan="2" class="text-center">([^<]+)<\/th>/.exec(html);
   if (dateMatch) {
     result.date = dateMatch[1].trim();
@@ -480,506 +807,629 @@ function parseRates(html) {
   let m;
   while ((m = regex.exec(html)) !== null) {
     let code = m[1].trim();
-    let valueStr = m[2].trim();
-    const val = parseFloat(valueStr);
-    if (!isNaN(val)) {
-      let multiplier = 1;
-      const multiMatch = code.match(/^(\d+)([A-Z]{3})$/);
-      if (multiMatch) {
-        multiplier = parseInt(multiMatch[1], 10);
-        code = multiMatch[2];
-      }
-      const normRate = val / multiplier;
-      result.rates[code] = normRate;
+    const val = parseFloat(m[2].trim());
+    if (!Number.isFinite(val)) continue;
+
+    let multiplier = 1;
+    const multiMatch = code.match(/^(\d+)([A-Z]{3})$/);
+    if (multiMatch) {
+      multiplier = parseInt(multiMatch[1], 10);
+      code = multiMatch[2];
     }
+
+    result.rates[code] = val / multiplier;
   }
   return result;
 }
 
-/**
- * Convert an amount from one currency to another using the current
- * exchange rates.  Returns null if either currency is unknown.
- */
-function convertAmount(amount, from, to) {
-  if (!rates.rates[from] || !rates.rates[to]) return null;
-  const inRon = amount * rates.rates[from];
-  return inRon / rates.rates[to];
-}
-
-/**
- * Send a JSON response with the given status code and object.  Adds
- * CORS headers to allow cross‑origin requests from any domain.
- */
-function sendJson(res, statusCode, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(statusCode, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    // Allow DELETE for investment removal
-    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  });
-  res.end(body);
-}
-
-/**
- * Serve a static file from the public directory.  If the file does not
- * exist the fallback index.html is returned so that client‑side routing
- * can handle the request.  MIME types are derived from file extension.
- */
-function serveStatic(reqPath, res) {
-  // If path is root or empty, serve index.html
-  let filePath = reqPath;
-  if (filePath === '/' || filePath === '') {
-    filePath = '/index.html';
+function parseFallbackRatesJson(jsonStr) {
+  const parsed = JSON.parse(jsonStr);
+  if (!parsed || !parsed.rates || typeof parsed.rates !== 'object') {
+    throw new Error('Fallback rates payload invalid');
   }
-  const fullPath = path.join(__dirname, 'public', filePath);
-  fs.readFile(fullPath, (err, data) => {
-    if (err) {
-      // Fallback to index.html for unmatched routes (SPA)
-      fs.readFile(path.join(__dirname, 'public', 'index.html'), (err2, indexData) => {
-        if (err2) {
-          res.writeHead(404);
-          res.end('Not found');
-        } else {
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(indexData);
-        }
-      });
-    } else {
-      // Determine basic content type
-      let contentType = 'text/plain';
-      if (filePath.endsWith('.html')) contentType = 'text/html';
-      else if (filePath.endsWith('.css')) contentType = 'text/css';
-      else if (filePath.endsWith('.js')) contentType = 'application/javascript';
-      else if (filePath.endsWith('.json')) contentType = 'application/json';
-      else if (filePath.endsWith('.png')) contentType = 'image/png';
-      else if (filePath.endsWith('.jpg') || filePath.endsWith('.jpeg')) contentType = 'image/jpeg';
-      else if (filePath.endsWith('.svg')) contentType = 'image/svg+xml';
-      res.writeHead(200, { 'Content-Type': contentType });
-      res.end(data);
+
+  // open.er-api.com/latest/RON uses RON as base.
+  const mapped = { RON: 1 };
+  Object.keys(parsed.rates).forEach((code) => {
+    const value = parseFloat(parsed.rates[code]);
+    if (Number.isFinite(value) && value > 0) {
+      mapped[code.toUpperCase()] = 1 / value;
     }
   });
+
+  return {
+    date: new Date().toISOString().split('T')[0],
+    rates: mapped,
+    provider: 'open.er-api.com',
+  };
 }
 
-/**
- * Handle incoming HTTP requests.  Routes beginning with `/api/` are
- * treated as API endpoints; all others are served from the public
- * directory.
- */
-function handleRequest(req, res) {
-  const parsed = url.parse(req.url, true);
-  const pathname = parsed.pathname || '/';
-  // Always set CORS headers for preflight requests
-  if (req.method === 'OPTIONS') {
-    // Include DELETE in allowed methods so that browsers can preflight
-    // requests for deletion of investments.  Without this the client
-    // would reject the DELETE request due to CORS restrictions.
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Max-Age': '86400',
+function httpsGetText(targetUrl, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(targetUrl, (res) => {
+      if (res.statusCode && res.statusCode >= 400) {
+        reject(new Error(`HTTP ${res.statusCode} for ${targetUrl}`));
+        res.resume();
+        return;
+      }
+      let data = '';
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      res.on('end', () => resolve(data));
     });
-    return res.end();
+
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Timeout fetching ${targetUrl}`));
+    });
+  });
+}
+
+async function fetchRates({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - lastRatesFetchAt < RATES_TTL_MS) {
+    return rates;
   }
-  if (pathname.startsWith('/api/')) {
-    // Parse JSON body for POST requests
-    if (req.method === 'POST') {
-      let body = '';
-      req.on('data', (chunk) => (body += chunk));
-      req.on('end', () => {
-        let payload = null;
-        if (body) {
-          try {
-            payload = JSON.parse(body);
-          } catch (e) {
-            return sendJson(res, 400, { error: 'Invalid JSON' });
-          }
-        }
-        routeApi(pathname, req.method, payload, res);
-      });
-    } else {
-      routeApi(pathname, req.method, null, res);
+  lastRatesFetchAt = now;
+
+  try {
+    const html = await httpsGetText('https://www.cursbnr.ro/');
+    const parsed = parseRatesFromCursBnr(html);
+    if (Object.keys(parsed.rates).length > 1) {
+      rates = parsed;
+      return rates;
     }
-  } else {
-    // Static file
-    serveStatic(pathname, res);
+    throw new Error('Primary provider returned insufficient rates');
+  } catch (primaryErr) {
+    console.warn('Primary rates provider failed:', primaryErr.message);
+    try {
+      const payload = await httpsGetText('https://open.er-api.com/v6/latest/RON');
+      const fallback = parseFallbackRatesJson(payload);
+      if (Object.keys(fallback.rates).length > 1) {
+        rates = fallback;
+        return rates;
+      }
+      throw new Error('Fallback provider returned insufficient rates');
+    } catch (fallbackErr) {
+      console.error('Fallback rates provider failed:', fallbackErr.message);
+      return rates;
+    }
   }
 }
 
-/**
- * Dispatch API requests based on the path and method.
- *
- * @param {string} pathName The request path
- * @param {string} method HTTP method
- * @param {any} body Parsed JSON body (for POST requests)
- * @param {http.ServerResponse} res Response object
- */
-function routeApi(pathName, method, body, res) {
-  // Expose the latest prediction generated by the LLM.  This returns
-  // null when no prediction has been computed or if the objective
-  // and investments have not been provided yet.
+function parseYearMonth(key) {
+  if (typeof key !== 'string') return null;
+  const [yearRaw, monthRaw] = key.split('-');
+  const year = parseInt(yearRaw, 10);
+  const month = parseInt(monthRaw, 10);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
+    return null;
+  }
+  return { year, month };
+}
+
+function buildMonthlyContributionSeries(currency) {
+  const monthly = new Map();
+  let minKey = null;
+  let maxKey = null;
+
+  investments.forEach((inv) => {
+    const date = normalizeDateInput(inv.date);
+    if (!date) return;
+
+    const isSale = (typeof inv.units === 'number' && inv.units < 0) || inv.amount < 0;
+    if (isSale) return;
+
+    const converted = convertAmount(Math.abs(inv.amount), inv.currency, currency);
+    if (converted == null || !Number.isFinite(converted)) return;
+
+    const key = date.slice(0, 7);
+    monthly.set(key, (monthly.get(key) || 0) + converted);
+    if (!minKey || key < minKey) minKey = key;
+    if (!maxKey || key > maxKey) maxKey = key;
+  });
+
+  if (!minKey || !maxKey) return [];
+
+  const start = parseYearMonth(minKey);
+  const end = parseYearMonth(maxKey);
+  if (!start || !end) return [];
+
+  const series = [];
+  let y = start.year;
+  let m = start.month;
+
+  while (y < end.year || (y === end.year && m <= end.month)) {
+    const key = `${y}-${String(m).padStart(2, '0')}`;
+    series.push(monthly.get(key) || 0);
+    m += 1;
+    if (m > 12) {
+      m = 1;
+      y += 1;
+    }
+  }
+
+  return series;
+}
+
+function generateLocalForecast() {
+  if (!objective) {
+    return 'Set an objective first to generate a forecast.';
+  }
+
+  const objectiveCurrency = sanitizeString(objective.currency, 'RON').toUpperCase();
+  const targetAmount = parseNumberMaybe(objective.targetAmount);
+  if (targetAmount == null || targetAmount <= 0) {
+    return 'Set a positive objective target to generate a forecast.';
+  }
+
+  const summary = computePortfolioSummary(objectiveCurrency);
+  const currentValue = summary.totals.currentValue;
+  const remainingGap = targetAmount - currentValue;
+
+  if (remainingGap <= 0) {
+    return `Goal reached. Current value is ${currentValue.toFixed(2)} ${objectiveCurrency}, above target ${targetAmount.toFixed(2)} ${objectiveCurrency}.`;
+  }
+
+  const monthlySeries = buildMonthlyContributionSeries(objectiveCurrency);
+  if (monthlySeries.length === 0) {
+    return `No contribution history available yet. Remaining gap is ${remainingGap.toFixed(2)} ${objectiveCurrency}.`;
+  }
+
+  const avgMonthlyAll = monthlySeries.reduce((sum, value) => sum + value, 0) / monthlySeries.length;
+  const recentWindow = monthlySeries.slice(-Math.min(6, monthlySeries.length));
+  const avgMonthlyRecent = recentWindow.reduce((sum, value) => sum + value, 0) / recentWindow.length;
+  const effectiveMonthly = (avgMonthlyAll * 0.65) + (avgMonthlyRecent * 0.35);
+
+  if (!Number.isFinite(effectiveMonthly) || effectiveMonthly <= 0.01) {
+    return `Unable to estimate timeline from current contribution pattern. Remaining gap is ${remainingGap.toFixed(2)} ${objectiveCurrency}.`;
+  }
+
+  const monthsToTarget = Math.max(1, Math.ceil(remainingGap / effectiveMonthly));
+  const yearsToTarget = monthsToTarget / 12;
+  const eta = new Date();
+  eta.setMonth(eta.getMonth() + monthsToTarget);
+  const etaDate = eta.toISOString().split('T')[0];
+
+  const durationLabel = monthsToTarget >= 12
+    ? `${monthsToTarget} months (~${yearsToTarget.toFixed(yearsToTarget >= 5 ? 1 : 2)} years)`
+    : `${monthsToTarget} months`;
+
+  return `Estimated time to goal: ${durationLabel}. Remaining gap: ${remainingGap.toFixed(2)} ${objectiveCurrency}. Based on effective monthly contributions of ${effectiveMonthly.toFixed(2)} ${objectiveCurrency} (recent average: ${avgMonthlyRecent.toFixed(2)}). Estimated completion around ${etaDate}.`;
+}
+
+function callPrediction() {
+  if (predicting) return;
+
+  predicting = true;
+  predictionId = generateId('pred');
+  try {
+    prediction = generateLocalForecast();
+  } catch (err) {
+    prediction = 'Forecast generation failed. Please try again.';
+    console.error('Forecast generation error:', err);
+  } finally {
+    predicting = false;
+  }
+}
+
+function routeApi(pathName, method, body, query, res) {
   if (pathName === '/api/prediction' && method === 'GET') {
-    return sendJson(res, 200, { 
-      prediction, 
-      isGenerating: predicting,
-      predictionId 
-    });
+    return sendJson(res, 200, { prediction, isGenerating: predicting, predictionId });
   }
-  // Manual endpoint to trigger prediction generation
+
   if (pathName === '/api/prediction' && method === 'POST') {
     try {
       callPrediction();
-      return sendJson(res, 200, { message: 'Prediction generation started' });
-    } catch (e) {
-      console.error('Error triggering prediction:', e);
+      return sendJson(res, 200, { message: 'Prediction generation started', predictionId });
+    } catch (err) {
       return sendJson(res, 500, { error: 'Failed to generate prediction' });
     }
   }
+
   if (pathName === '/api/rates' && method === 'GET') {
     return sendJson(res, 200, rates);
   }
-  if (pathName === '/api/investments') {
-    if (method === 'GET') {
-      // Sort investments by timestamp in descending order (newest first) before returning
-      const sortedInvestments = [...investments].sort((a, b) => b.timestamp - a.timestamp);
-      return sendJson(res, 200, sortedInvestments);
-    } else if (method === 'POST') {
-      // New investments can include the price per unit and the number of units
-      // purchased.  If both `unitPrice` and `units` are provided and are
-      // numeric, compute the total amount as `unitPrice * units`.  If
-      // `amount` is provided instead, use it directly.  Currency, fund,
-      // platform and date are always required.
-      if (!body || !body.currency || !body.fund || !body.platform || !body.date) {
-        return sendJson(res, 400, { error: 'Invalid investment payload' });
-      }
-      let amount = null;
-      if (typeof body.unitPrice === 'number' && typeof body.units === 'number' && body.unitPrice >= 0) {
-        // Allow negative units to represent a sale.  The amount will be
-        // negative when units < 0, decreasing the invested total.
-        amount = body.unitPrice * body.units;
-      } else if (typeof body.amount === 'number') {
-        amount = body.amount;
-      }
-      if (amount === null) {
-        return sendJson(res, 400, { error: 'Investment must include either amount or unitPrice and units' });
-      }
-      // Assign a timestamp to preserve the exact insertion order.  This
-      // allows us to identify the most recent investment for a given
-      // fund even when multiple entries share the same date.  We
-      // convert the timestamp to a string for backwards compatibility
-      // with pre‑existing data which used the ID as the timestamp.
-      const timestamp = Date.now();
-      const id = timestamp.toString();
-      const newInv = {
-        id,
-        timestamp,
-        amount,
-        currency: body.currency.toUpperCase(),
-        fund: body.fund,
-        platform: body.platform,
-        date: body.date,
-      };
-      // Store unit price and units if provided
-      if (typeof body.unitPrice === 'number') newInv.unitPrice = body.unitPrice;
-      if (typeof body.units === 'number') newInv.units = body.units;
-      // Mark sales explicitly (negative units) for clarity in the UI.  A sale
-      // is defined as any entry where units are negative.  This field
-      // simplifies filtering and display on the client side, though the
-      // calculation logic treats negative units generically.
-      if (typeof newInv.units === 'number' && newInv.units < 0) {
-        newInv.isSale = true;
-      }
-      investments.push(newInv);
-      // Sort investments by timestamp in descending order (newest first) after adding
-      investments.sort((a, b) => b.timestamp - a.timestamp);
-      saveData();
-      return sendJson(res, 201, newInv);
-    }
+
+  if (pathName === '/api/portfolio/summary' && method === 'GET') {
+    const currency = sanitizeString(query.currency, objective?.currency || 'RON').toUpperCase();
+    const summary = computePortfolioSummary(currency);
+    return sendJson(res, 200, summary);
   }
-  // DELETE a specific investment by ID.  The ID is provided as part of the
-  // URL, e.g. /api/investments/1234567890.  If the investment exists it is
-  // removed from the array and persisted.  Returns 204 No Content on
-  // success or 404 if the ID does not exist.
-  if (pathName.startsWith('/api/investments/') && method === 'DELETE') {
+
+  if (pathName === '/api/investments' && method === 'GET') {
+    const result = buildQueryResult(investments, query || {});
+    return sendJson(res, 200, result.data);
+  }
+
+  if (pathName === '/api/investments' && method === 'POST') {
+    const parsed = normalizeInvestmentPayload(body, null);
+    if (!parsed.ok) {
+      return sendJson(res, 400, { error: parsed.error });
+    }
+
+    const timestamp = Date.now();
+    const inv = {
+      id: generateId('inv'),
+      timestamp,
+      ...parsed.investment,
+    };
+
+    investments.push(inv);
+    sortInvestmentsByTimestampDesc(investments);
+    saveData();
+    return sendJson(res, 201, inv);
+  }
+
+  if (pathName === '/api/investments/bulk-delete' && method === 'POST') {
+    if (!body || !Array.isArray(body.ids)) {
+      return sendJson(res, 400, { error: 'ids array is required' });
+    }
+
+    const ids = new Set(body.ids.filter((id) => typeof id === 'string' && id));
+    const before = investments.length;
+    const existingIds = new Set(investments.map((inv) => inv.id));
+    const notFound = [];
+    ids.forEach((id) => {
+      if (!existingIds.has(id)) notFound.push(id);
+    });
+
+    investments = investments.filter((inv) => !ids.has(inv.id));
+    const deleted = before - investments.length;
+
+    if (deleted > 0) {
+      saveData();
+    }
+
+    return sendJson(res, 200, {
+      deleted,
+      requested: ids.size,
+      notFound,
+      remaining: investments.length,
+    });
+  }
+
+  if (pathName.startsWith('/api/investments/')) {
     const parts = pathName.split('/');
-    // Expect [ '', 'api', 'investments', '<id>' ]
-    const invId = parts.length >= 4 ? parts[3] : null;
+    const invId = parts[3];
+
     if (!invId) {
       return sendJson(res, 400, { error: 'Invalid ID' });
     }
+
     const index = investments.findIndex((inv) => inv.id === invId);
     if (index === -1) {
       return sendJson(res, 404, { error: 'Investment not found' });
     }
-    investments.splice(index, 1);
-    saveData();
-    // Send 204 No Content (empty response body)
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
-    return res.end();
+
+    if (method === 'DELETE') {
+      investments.splice(index, 1);
+      saveData();
+      return sendNoContent(res);
+    }
+
+    if (method === 'PUT') {
+      const existing = investments[index];
+      const parsed = normalizeInvestmentPayload(body, existing);
+      if (!parsed.ok) {
+        return sendJson(res, 400, { error: parsed.error });
+      }
+
+      const updated = {
+        ...existing,
+        ...parsed.investment,
+      };
+      if (!(typeof updated.units === 'number' && updated.units < 0)) {
+        delete updated.isSale;
+      }
+      investments[index] = updated;
+      sortInvestmentsByTimestampDesc(investments);
+      saveData();
+      return sendJson(res, 200, updated);
+    }
   }
+
   if (pathName === '/api/objective') {
     if (method === 'GET') {
       if (!objective) {
         return sendJson(res, 200, null);
       }
-      // Compute current total value by summing, per fund, the value of known
-      // units at the latest unit price plus any investments with unknown unit
-      // information converted directly by amount.  For each fund we group
-      // investments and determine:
-      //   * totalUnits: sum of units across investments where units are known or
-      //     can be derived from unitPrice.
-      //   * unknownValue: sum of converted amounts for investments where units
-      //     cannot be determined.
-      //   * latestPrice/latestCurrency: the most recent investment's unit price and
-      //     currency.
-      // The total value for the fund is (latestPrice * totalUnits) converted to
-      // the objective currency plus unknownValue.
-      let total = 0;
-      const byFund = {};
-      for (const inv of investments) {
-        if (!byFund[inv.fund]) byFund[inv.fund] = [];
-        byFund[inv.fund].push(inv);
-      }
-      for (const fund in byFund) {
-        const invs = byFund[fund];
-        // Identify the most recent investment for this fund.  We use
-        // the `date` field as the primary ordering key and fall back
-        // on `timestamp` (or numeric `id`) to break ties when the
-        // dates are equal.  This ensures that if multiple entries share
-        // the same date the one added last (highest timestamp) will
-        // determine the latest price.
-        let latestInv = null;
-        invs.forEach((inv) => {
-          if (!latestInv) {
-            latestInv = inv;
-            return;
-          }
-          if (inv.date > latestInv.date) {
-            latestInv = inv;
-          } else if (inv.date === latestInv.date) {
-            // Compare timestamps (falling back to numeric id if timestamp is missing)
-            const currentTs = inv.timestamp != null ? inv.timestamp : parseInt(inv.id, 10);
-            const bestTs = latestInv.timestamp != null ? latestInv.timestamp : parseInt(latestInv.id, 10);
-            if (!isNaN(currentTs) && !isNaN(bestTs) && currentTs > bestTs) {
-              latestInv = inv;
-            }
-          }
-        });
-        let latestPrice = null;
-        let latestCurrency = null;
-        if (latestInv) {
-          if (typeof latestInv.unitPrice === 'number') {
-            latestPrice = latestInv.unitPrice;
-            latestCurrency = latestInv.currency;
-          } else if (typeof latestInv.units === 'number' && latestInv.units > 0) {
-            latestPrice = latestInv.amount / latestInv.units;
-            latestCurrency = latestInv.currency;
-          }
-        }
-        // If we cannot determine a latest price we fallback to converting amounts directly
-        if (latestPrice == null || latestCurrency == null) {
-          for (const inv of invs) {
-            const conv = convertAmount(inv.amount, inv.currency, objective.currency);
-            if (conv != null) total += conv;
-          }
-          continue;
-        }
-        // Sum units for all investments using the latest price for unknown units
-        let totalUnits = 0;
-        for (const inv of invs) {
-          if (typeof inv.units === 'number') {
-            totalUnits += inv.units;
-          } else if (typeof inv.unitPrice === 'number') {
-            totalUnits += inv.amount / inv.unitPrice;
-          } else {
-            // Unknown units: convert amount to latest currency then divide by latest price
-            const conv = convertAmount(inv.amount, inv.currency, latestCurrency);
-            if (conv != null) totalUnits += conv / latestPrice;
-          }
-        }
-        // Compute value: total units times latest price, converted to objective currency
-        const valueInLatestCurrency = latestPrice * totalUnits;
-        const valueInObjective = convertAmount(valueInLatestCurrency, latestCurrency, objective.currency);
-        if (valueInObjective != null) total += valueInObjective;
-      }
-      return sendJson(res, 200, { targetAmount: objective.targetAmount, currency: objective.currency, currentTotal: total });
-    } else if (method === 'POST') {
+      const summary = computePortfolioSummary(objective.currency);
+      return sendJson(res, 200, {
+        targetAmount: objective.targetAmount,
+        currency: objective.currency,
+        currentTotal: summary.totals.currentValue,
+      });
+    }
+
+    if (method === 'POST') {
       if (!body || typeof body.targetAmount !== 'number' || !body.currency) {
         return sendJson(res, 400, { error: 'Invalid objective payload' });
       }
+
       objective = {
         targetAmount: body.targetAmount,
-        currency: body.currency.toUpperCase(),
+        currency: sanitizeString(body.currency, 'RON').toUpperCase(),
       };
       saveData();
       return sendJson(res, 200, objective);
     }
   }
+
   if (pathName === '/api/net-worth') {
     if (method === 'GET') {
       return sendJson(res, 200, netWorth);
-    } else if (method === 'POST') {
+    }
+
+    if (method === 'POST') {
       if (!body || !Array.isArray(body.manualItems)) {
         return sendJson(res, 400, { error: 'Invalid net worth payload' });
       }
+
       const cleaned = body.manualItems.map((item, idx) => {
-        const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : `Item ${idx + 1}`;
+        const name = sanitizeString(item.name, `Item ${idx + 1}`);
         const type = item.type === 'liability' ? 'liability' : 'asset';
-        const value = typeof item.value === 'number' ? item.value : parseFloat(item.value);
-        const currency = typeof item.currency === 'string' && item.currency ? item.currency.toUpperCase() : 'RON';
-        const id = typeof item.id === 'string' && item.id ? item.id : `${Date.now()}-${idx}`;
+        const value = parseNumberMaybe(item.value);
+        const currency = sanitizeString(item.currency, 'RON').toUpperCase();
+        const id = sanitizeString(item.id, generateId('nw'));
         return {
           id,
           name,
           type,
-          value: isNaN(value) ? 0 : value,
+          value: value == null ? 0 : value,
           currency,
         };
       });
+
       netWorth = { ...netWorth, manualItems: cleaned };
       saveData();
       return sendJson(res, 200, netWorth);
     }
   }
+
   if (pathName === '/api/milestones') {
     if (method === 'GET') {
       return sendJson(res, 200, { milestones, currency: milestonesCurrency });
-    } else if (method === 'POST') {
+    }
+
+    if (method === 'POST') {
       if (!body || !Array.isArray(body.milestones)) {
         return sendJson(res, 400, { error: 'Invalid milestones payload' });
       }
+
       milestones = body.milestones.map((item, idx) => {
-        const target = typeof item.target === 'number' ? item.target : parseFloat(item.target);
-        const targetDate = typeof item.targetDate === 'string' ? item.targetDate : '';
-        const id = typeof item.id === 'string' && item.id ? item.id : `${Date.now()}-${idx}`;
+        const target = parseNumberMaybe(item.target);
+        const targetDate = normalizeDateInput(item.targetDate) || '';
+        const id = sanitizeString(item.id, generateId(`ms${idx}`));
         return {
           id,
-          target: isNaN(target) ? 0 : target,
+          target: target == null ? 0 : target,
           targetDate,
         };
       });
+
       if (body.currency && typeof body.currency === 'string') {
         milestonesCurrency = body.currency.toUpperCase();
       }
+
       saveData();
       return sendJson(res, 200, { milestones, currency: milestonesCurrency });
     }
   }
+
   if (pathName === '/api/profit') {
     if (method === 'GET') {
       return sendJson(res, 200, profitTracker);
-    } else if (method === 'POST') {
+    }
+
+    if (method === 'POST') {
       if (!body || (body.entries && !Array.isArray(body.entries))) {
         return sendJson(res, 400, { error: 'Invalid profit payload' });
       }
+
       if (Array.isArray(body.entries)) {
         profitTracker.entries = body.entries.map((item, idx) => {
-          const amount = typeof item.amount === 'number' ? item.amount : parseFloat(item.amount);
-          const date = typeof item.date === 'string' ? item.date : '';
-          const name = typeof item.name === 'string' ? item.name : '';
-          const comment = typeof item.comment === 'string' ? item.comment : '';
-          const id = typeof item.id === 'string' && item.id ? item.id : `${Date.now()}-${idx}`;
+          const amount = parseNumberMaybe(item.amount);
+          const date = normalizeDateInput(item.date) || '';
+          const name = sanitizeString(item.name, '');
+          const comment = sanitizeString(item.comment, '');
+          const id = sanitizeString(item.id, generateId(`pf${idx}`));
           return {
             id,
             date,
-            amount: isNaN(amount) ? 0 : amount,
+            amount: amount == null ? 0 : amount,
             name,
             comment,
           };
         });
       }
+
       if (body.settings && typeof body.settings === 'object') {
         const next = { ...profitTracker.settings };
-        if (body.settings.minSalary != null) {
-          const minSalary = typeof body.settings.minSalary === 'number' ? body.settings.minSalary : parseFloat(body.settings.minSalary);
-          if (!isNaN(minSalary)) next.minSalary = minSalary;
-        }
-        if (body.settings.cassRate != null) {
-          const cassRate = typeof body.settings.cassRate === 'number' ? body.settings.cassRate : parseFloat(body.settings.cassRate);
-          if (!isNaN(cassRate)) next.cassRate = cassRate;
-        }
-        if (body.settings.currency && typeof body.settings.currency === 'string') {
+
+        const minSalary = parseNumberMaybe(body.settings.minSalary);
+        if (minSalary != null) next.minSalary = minSalary;
+
+        const cassRate = parseNumberMaybe(body.settings.cassRate);
+        if (cassRate != null) next.cassRate = cassRate;
+
+        if (typeof body.settings.currency === 'string') {
           next.currency = body.settings.currency.toUpperCase();
         }
+
         if (Array.isArray(body.settings.thresholds) && body.settings.thresholds.length > 0) {
-          next.thresholds = body.settings.thresholds.map((t) => (typeof t === 'number' ? t : parseFloat(t))).filter((t) => !isNaN(t));
+          const parsedThresholds = body.settings.thresholds
+            .map((t) => parseNumberMaybe(t))
+            .filter((t) => t != null);
+          if (parsedThresholds.length > 0) {
+            next.thresholds = parsedThresholds;
+          }
         }
+
         profitTracker.settings = next;
       }
+
       saveData();
       return sendJson(res, 200, profitTracker);
     }
   }
-  // Import a set of investments from a JSON payload.  The body
-  // should contain an `investments` array, each with at least
-  // currency, fund, platform, date and either unitPrice and units or
-  // amount.  Existing data is replaced entirely with the imported
-  // entries.  This route is useful for restoring backups or bulk
-  // importing from a file.
+
+  if (pathName === '/api/import/validate' && method === 'POST') {
+    if (!body || !Array.isArray(body.investments)) {
+      return sendJson(res, 400, { error: 'Invalid import payload' });
+    }
+
+    const validation = validateImportRows(body.investments);
+    return sendJson(res, 200, validation);
+  }
+
   if (pathName === '/api/import' && method === 'POST') {
     if (!body || !Array.isArray(body.investments)) {
       return sendJson(res, 400, { error: 'Invalid import payload' });
     }
-    const newInvs = [];
-    for (const item of body.investments) {
-      // Validate basic fields
-      if (!item || !item.currency || !item.fund || !item.platform || !item.date) {
-        continue;
-      }
-      let amount = null;
-      // Convert numeric strings to numbers if necessary
-      const unitPrice = typeof item.unitPrice === 'number' ? item.unitPrice : parseFloat(item.unitPrice);
-      const units = typeof item.units === 'number' ? item.units : parseFloat(item.units);
-      const amountVal = typeof item.amount === 'number' ? item.amount : parseFloat(item.amount);
-      if (!isNaN(unitPrice) && !isNaN(units) && unitPrice >= 0) {
-        amount = unitPrice * units;
-      } else if (!isNaN(amountVal)) {
-        amount = amountVal;
-      } else {
-        // Skip entries that do not provide enough info
-        continue;
-      }
-      const timestamp = Date.now();
-      const id = timestamp.toString();
-      const inv = {
-        id,
-        timestamp,
-        amount,
-        currency: item.currency.toUpperCase(),
-        fund: item.fund,
-        platform: item.platform,
-        date: item.date,
-      };
-      if (!isNaN(unitPrice)) inv.unitPrice = unitPrice;
-      if (!isNaN(units)) inv.units = units;
-      if (typeof inv.units === 'number' && inv.units < 0) inv.isSale = true;
-      newInvs.push(inv);
+
+    const mode = sanitizeString(body.mode, 'replace').toLowerCase();
+    const validation = validateImportRows(body.investments);
+
+    const created = validation.validRows.map((row) => ({
+      id: generateId('inv'),
+      timestamp: Date.now() + Math.floor(Math.random() * 1000),
+      ...row,
+    }));
+
+    if (mode === 'append') {
+      investments = investments.concat(created);
+    } else {
+      investments = created;
     }
-    investments = newInvs;
-    // Sort investments by timestamp in descending order (newest first) after import
-    investments.sort((a, b) => b.timestamp - a.timestamp);
+
+    sortInvestmentsByTimestampDesc(investments);
     saveData();
-    return sendJson(res, 200, { imported: newInvs.length });
+
+    return sendJson(res, 200, {
+      imported: created.length,
+      invalid: validation.invalidRows.length,
+      invalidRows: validation.invalidRows,
+      mode,
+      total: investments.length,
+    });
   }
-  // Unknown API route
+
   return sendJson(res, 404, { error: 'Not found' });
 }
 
-// Initialise application state and schedule periodic tasks
-loadData();
-fetchRates();
-// No longer generate initial prediction automatically
-setInterval(fetchRates, 24 * 60 * 60 * 1000);
+function handleRequest(req, res) {
+  const parsed = url.parse(req.url, true);
+  const pathname = parsed.pathname || '/';
+  const query = parsed.query || {};
 
-// Start HTTP server
-const PORT = process.env.PORT || 3000;
-const server = http.createServer(handleRequest);
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      ...CORS_HEADERS,
+      'Access-Control-Max-Age': '86400',
+    });
+    res.end();
+    return;
+  }
+
+  if (pathname.startsWith('/api/')) {
+    if (req.method === 'POST' || req.method === 'PUT') {
+      parseRequestBody(req, res, (err, payload) => {
+        if (err) {
+          sendJson(res, 400, { error: err.message || 'Invalid request body' });
+          return;
+        }
+        routeApi(pathname, req.method, payload, query, res);
+      });
+      return;
+    }
+
+    routeApi(pathname, req.method, null, query, res);
+    return;
+  }
+
+  serveStatic(pathname, req, res).catch((err) => {
+    console.error('Static serving error:', err);
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Internal server error');
+  });
+}
+
+async function gracefulShutdown(signal) {
+  console.log(`Received ${signal}, flushing data and shutting down...`);
+  if (ratesInterval) {
+    clearInterval(ratesInterval);
+    ratesInterval = null;
+  }
+
+  try {
+    await forceFlushData();
+  } catch (err) {
+    console.error('Error flushing data during shutdown:', err);
+  }
+
+  if (server) {
+    server.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 3000).unref();
+  } else {
+    process.exit(0);
+  }
+}
+
+function startServer() {
+  loadData();
+
+  fetchRates({ force: true }).catch((err) => {
+    console.error('Initial rates fetch failed:', err.message);
+  });
+  ratesInterval = setInterval(() => {
+    fetchRates().catch((err) => {
+      console.error('Scheduled rates fetch failed:', err.message);
+    });
+  }, RATES_TTL_MS);
+
+  const PORT = parseInt(process.env.PORT || '3000', 10);
+  server = http.createServer(handleRequest);
+
+  server.on('error', (err) => {
+    console.error('Server error:', err);
+  });
+
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+
+  process.on('SIGINT', () => {
+    gracefulShutdown('SIGINT').catch((err) => {
+      console.error('Shutdown error:', err);
+      process.exit(1);
+    });
+  });
+
+  process.on('SIGTERM', () => {
+    gracefulShutdown('SIGTERM').catch((err) => {
+      console.error('Shutdown error:', err);
+      process.exit(1);
+    });
+  });
+
+  return server;
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  startServer,
+  parseRatesFromCursBnr,
+  parseFallbackRatesJson,
+  convertAmount,
+  normalizeInvestmentPayload,
+  validateImportRows,
+  buildQueryResult,
+  computePortfolioSummary,
+};

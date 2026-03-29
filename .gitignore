@@ -15,6 +15,7 @@ node_modules/
 # Build outputs
 /dist
 /build
+/investments-app/backend/public/
 
 # Env
 .env
@@ -36,3 +37,6 @@ coverage/
 # Misc
 *.tmp
 *.swp
+
+# App-local runtime data
+/investments-app/backend/data.json

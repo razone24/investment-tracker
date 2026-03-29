@@ -1,13 +1,18 @@
-FROM node:16-alpine
+FROM node:20-alpine AS frontend-builder
 
-# Set working directory inside the container
+WORKDIR /build/frontend
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+FROM node:20-alpine AS app
+
 WORKDIR /app
+COPY backend/package*.json ./
+RUN npm install --omit=dev
+COPY backend/server.js ./
+COPY --from=frontend-builder /build/backend/public ./public
 
-# Copy backend files into the container
-COPY backend ./
-
-# Expose the port the server listens on
 EXPOSE 3000
-
-# Run the application
 CMD ["node", "server.js"]

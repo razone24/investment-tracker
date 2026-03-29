@@ -45,7 +45,7 @@ docker compose up --build -d
 2. Open:
 
 ```text
-http://localhost:3000
+http://localhost:3001
 ```
 
 3. Stop:
@@ -98,7 +98,7 @@ docker compose down
 
 ## Environment Variables
 
-- `PORT` (default: `3000`)
+- `PORT` (default: `3001`)
 
 ## Local Development
 

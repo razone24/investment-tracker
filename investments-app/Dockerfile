@@ -14,5 +14,5 @@ RUN npm install --omit=dev
 COPY backend/server.js ./
 COPY --from=frontend-builder /build/backend/public ./public
 
-EXPOSE 3000
+EXPOSE 3001
 CMD ["node", "server.js"]

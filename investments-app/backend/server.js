@@ -1391,7 +1391,7 @@ function startServer() {
     });
   }, RATES_TTL_MS);
 
-  const PORT = parseInt(process.env.PORT || '3000', 10);
+  const PORT = parseInt(process.env.PORT || '3001', 10);
   server = http.createServer(handleRequest);
 
   server.on('error', (err) => {
